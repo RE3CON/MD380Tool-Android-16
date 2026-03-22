@@ -142,10 +142,28 @@ Thread.sleep(5);`,
     setFlashing(false);
   };
 
+  const [dbFile, setDbFile] = useState<File | null>(null);
+  const [dbFileData, setDbFileData] = useState<Uint8Array | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (selectedFile) {
+      setDbFile(selectedFile);
+      const buffer = await selectedFile.arrayBuffer();
+      setDbFileData(new Uint8Array(buffer));
+    }
+  };
+
   const handleFlashDatabase = async () => {
     if (!device.connected) {
       alert('Please connect your radio first.');
       setActiveTab('device');
+      return;
+    }
+
+    if (!dbFileData) {
+      alert('Please select a CSV database file first.');
       return;
     }
 
@@ -156,7 +174,7 @@ Thread.sleep(5);`,
       console.log('Android 16 Compatibility Mode: Applying 50ms SPI buffer delay...');
     }
 
-    const success = await flashDatabase((progress) => {
+    const success = await flashDatabase(dbFileData, (progress) => {
       setFlashProgress(progress);
     }, android16Mode);
 
@@ -230,7 +248,7 @@ Thread.sleep(5);`,
             <Settings className="w-3 h-3" />
             System Config
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2 mb-4">
             <div className="flex justify-between text-[11px]">
               <span>API Status</span>
               <span className="text-emerald-500">ONLINE</span>
@@ -240,6 +258,15 @@ Thread.sleep(5);`,
               <span className="text-emerald-500">SUPPORTED</span>
             </div>
           </div>
+          <a 
+            href="https://github.com/RE3CON/MD380Tool-Android-16" 
+            target="_blank" 
+            rel="noreferrer"
+            className="flex items-center gap-2 text-xs text-[#e4e3e0]/70 hover:text-[#ffb000] transition-colors"
+          >
+            <Github className="w-4 h-4" />
+            View on GitHub
+          </a>
         </div>
       </aside>
 
@@ -562,13 +589,27 @@ Thread.sleep(5);`,
                     />
                   </div>
                   <div className="flex gap-3">
+                    <input 
+                      type="file" 
+                      ref={fileInputRef}
+                      onChange={handleFileSelect}
+                      accept=".csv,.bin"
+                      className="hidden"
+                    />
+                    <button 
+                      onClick={() => fileInputRef.current?.click()}
+                      className="btn-secondary flex items-center gap-2"
+                    >
+                      <FileText className="w-4 h-4" />
+                      {dbFile ? dbFile.name : 'Select CSV File'}
+                    </button>
                     <button className="btn-secondary flex items-center gap-2">
                       <Download className="w-4 h-4" />
                       Download Latest CSV
                     </button>
                     <button 
                       onClick={handleFlashDatabase}
-                      disabled={flashing}
+                      disabled={flashing || !dbFileData}
                       className="btn-primary flex items-center gap-2 disabled:opacity-50"
                     >
                       <Database className="w-4 h-4" />

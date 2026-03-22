@@ -223,6 +223,7 @@ export const flashFirmware = async (
  * This function implements block-by-block synchronization adapted for Android 16 / S24U.
  */
 export const flashDatabase = async (
+  dataBuffer: Uint8Array,
   onProgress: (progress: number) => void,
   isAndroid16: boolean = false
 ): Promise<boolean> => {
@@ -234,13 +235,12 @@ export const flashDatabase = async (
   try {
     const device = activeDevice;
     const CHUNK_SIZE = 1024; // SPI Flash write block size
-    const TOTAL_SIZE = 1 * 1024 * 1024; // Mock 1MB UserDB
+    const TOTAL_SIZE = dataBuffer.length;
     const TOTAL_BLOCKS = Math.ceil(TOTAL_SIZE / CHUNK_SIZE);
     
-    console.log('Starting User Database (SPI Flash) transfer...');
+    console.log(`Starting User Database (SPI Flash) transfer... Size: ${TOTAL_SIZE} bytes`);
 
     // 1. Initialize SPI Flash Write Mode
-    // Some MD380 bootloaders require a specific initialization command before SPI writes
     await device.controlTransferOut({
       requestType: 'vendor',
       recipient: 'device',
@@ -251,11 +251,15 @@ export const flashDatabase = async (
     await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 50));
 
     for (let block = 0; block < TOTAL_BLOCKS; block++) {
-      // Mock CSV/DB data for this block
-      const data = new Uint8Array(CHUNK_SIZE).fill(0xBB);
+      const offset = block * CHUNK_SIZE;
+      const chunk = dataBuffer.slice(offset, offset + CHUNK_SIZE);
+      
+      // Pad the last block if necessary
+      const paddedChunk = new Uint8Array(CHUNK_SIZE);
+      paddedChunk.set(chunk);
       
       // Calculate SPI Flash Address (Block * 1024)
-      const address = block * CHUNK_SIZE;
+      const address = offset;
       const wValue = (address >> 16) & 0xFFFF; // High 16 bits
       const wIndex = address & 0xFFFF;         // Low 16 bits
       
@@ -266,22 +270,16 @@ export const flashDatabase = async (
         request: 0x91, // Write SPI Flash command
         value: wValue,
         index: wIndex
-      }, data);
+      }, paddedChunk);
 
       // 3. Android 16 / S24U Timing Patch (Slower Pacing)
-      // The SPI flash is much slower than internal STM32 flash.
-      // High-speed controllers on Snapdragon 8 Gen 3 will overwhelm the radio
-      // if we don't pace the block synchronization correctly.
       if (isAndroid16) {
-        // Super deep fix: Android 16 USB stack needs 50ms for SPI page writes to settle
         await new Promise(r => setTimeout(r, 50)); 
       } else {
         await new Promise(r => setTimeout(r, 15)); 
       }
 
       // 4. Verify/Sync Block (bRequest = 0x92 - Read SPI Flash Status)
-      // This ensures the radio has actually committed the block to SPI memory
-      // before we blast the next one, preventing the "doesn't work at all" issue.
       try {
         await device.controlTransferIn({
           requestType: 'vendor',
