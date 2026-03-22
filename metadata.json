@@ -1,0 +1,5 @@
+{
+  "name": "MD380 Web Tool",
+  "description": "A web-based management tool for Tytera MD-380 DMR radios, featuring user database updates, firmware patching, and Android 16 compatibility guides.",
+  "requestFramePermissions": ["usb"]
+}
