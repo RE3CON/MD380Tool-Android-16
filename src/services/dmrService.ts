@@ -18,28 +18,55 @@ export const fetchDMRUsers = async (): Promise<DMRUser[]> => {
 let activeDevice: any = null;
 
 const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
-  const transferIn = async (params: any, length: number, retries = 10) => {
-    const delay = isAndroid16 ? 500 : 200;
+  const transferIn = async (params: any, length: number, retries = 15) => {
+    const baseDelay = isAndroid16 ? 600 : 200;
     for (let i = 0; i < retries; i++) {
       try {
-        if (!activeDevice) throw new Error('Device disconnected');
+        if (!activeDevice || !device.opened) throw new Error('Device disconnected');
         return await device.controlTransferIn(params, length);
-      } catch (e) {
+      } catch (e: any) {
         if (i === retries - 1) throw e;
-        await new Promise(r => setTimeout(r, delay));
+        
+        // If we get a transfer error, the device might be stalled or busy
+        if (e.name === 'NetworkError' || e.message?.includes('transfer error')) {
+           try {
+             await device.controlTransferOut({
+               requestType: 'class',
+               recipient: 'interface',
+               request: 4, // DFU_CLRSTATUS
+               value: 0,
+               index: 0
+             });
+           } catch (ignore) {}
+        }
+        
+        await new Promise(r => setTimeout(r, baseDelay + (i * 100)));
       }
     }
   };
 
-  const transferOut = async (params: any, data?: Uint8Array, retries = 10) => {
-    const delay = isAndroid16 ? 500 : 200;
+  const transferOut = async (params: any, data?: Uint8Array, retries = 15) => {
+    const baseDelay = isAndroid16 ? 600 : 200;
     for (let i = 0; i < retries; i++) {
       try {
-        if (!activeDevice) throw new Error('Device disconnected');
+        if (!activeDevice || !device.opened) throw new Error('Device disconnected');
         return await device.controlTransferOut(params, data);
-      } catch (e) {
+      } catch (e: any) {
         if (i === retries - 1) throw e;
-        await new Promise(r => setTimeout(r, delay));
+        
+        if (e.name === 'NetworkError' || e.message?.includes('transfer error')) {
+           try {
+             await device.controlTransferOut({
+               requestType: 'class',
+               recipient: 'interface',
+               request: 4, // DFU_CLRSTATUS
+               value: 0,
+               index: 0
+             });
+           } catch (ignore) {}
+        }
+        
+        await new Promise(r => setTimeout(r, baseDelay + (i * 100)));
       }
     }
   };
@@ -408,9 +435,9 @@ export const flashDatabase = async (
 
       // 3. Android 16 / S24U Timing Patch (Slower Pacing)
       if (isAndroid16) {
-        await new Promise(r => setTimeout(r, 50)); 
+        await new Promise(r => setTimeout(r, 100)); 
       } else {
-        await new Promise(r => setTimeout(r, 15)); 
+        await new Promise(r => setTimeout(r, 40)); 
       }
 
       // 4. Verify/Sync Block (bRequest = 0x92 - Read SPI Flash Status)
@@ -503,7 +530,7 @@ export const readFirmware = async (
     const setAddrCmd = new Uint8Array([0x21, 0x00, 0xC0, 0x00, 0x08]);
     await download(0, setAddrCmd);
 
-    let statusRetries = 3;
+    let statusRetries = 5;
     while (statusRetries > 0) {
       try {
         await getStatus();
@@ -549,9 +576,9 @@ export const readFirmware = async (
       }
 
       if (isAndroid16) {
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 150));
       } else {
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise(r => setTimeout(r, 80));
       }
 
       onProgress(((block + 1) / TOTAL_BLOCKS) * 100);
