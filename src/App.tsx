@@ -1,1779 +1,398 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Radio, 
-  Database, 
   Cpu, 
-  Smartphone, 
-  Settings, 
-  Activity, 
   Download, 
   Usb, 
   CheckCircle2, 
   AlertCircle,
-  Search,
   RefreshCw,
   Info,
   Github,
-  FileText,
-  Users,
-  Folder,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Wrench,
+  Terminal,
+  FileUp,
+  HelpCircle,
+  ShieldAlert
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  BarChart, 
-  Bar, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer,
-  Cell
-} from 'recharts';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { DMRUser, DeviceStatus, AndroidPatchInfo } from './types';
-import { fetchDMRUsers, requestDevice, flashFirmware, flashDatabase, readFirmware, readCodeplug, writeCodeplug, uploadFirmwareFile } from './services/dmrService';
+import { availableMods, Mod } from './mods';
+import { patchFirmware, flashFirmware } from './services/patcher';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'device' | 'database' | 'firmware' | 'codeplug' | 'android' | 'resources' | 'features'>('device');
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [users, setUsers] = useState<DMRUser[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [flashing, setFlashing] = useState(false);
-  const [reading, setReading] = useState(false);
+  const [activeTab, setActiveTab] = useState<'mods' | 'instructions' | 'about'>('mods');
+  const [mods, setMods] = useState<Mod[]>(availableMods);
+  const [logs, setLogs] = useState<string[]>(['Ready to patch. Select mods and click "Patch firmware".']);
+  const [isPatching, setIsPatching] = useState(false);
+  const [isFlashing, setIsFlashing] = useState(false);
   const [flashProgress, setFlashProgress] = useState(0);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [android16Mode, setAndroid16Mode] = useState(false);
-  const firmwareInputRef = useRef<HTMLInputElement>(null);
-  const codeplugInputRef = useRef<HTMLInputElement>(null);
-  const [device, setDevice] = useState<DeviceStatus>({
-    connected: false,
-    model: 'MD-380',
-    firmware: 'D013.020 (Original)',
-  });
-  const [searchQuery, setSearchQuery] = useState('');
+  const [patchedFirmware, setPatchedFirmware] = useState<Uint8Array | null>(null);
+  const [baseFirmware, setBaseFirmware] = useState<Uint8Array | null>(new Uint8Array(65536).fill(0xAA)); // Simulated base v26
+  const [useDefaultFirmware, setUseDefaultFirmware] = useState(true);
+  const [radioModel, setRadioModel] = useState<string>('*');
+  const [showInstructions, setShowInstructions] = useState(false);
+  
+  const consoleRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const androidPatches: AndroidPatchInfo[] = [
-    {
-      title: 'Scoped Storage Fix',
-      description: 'Updates file access to use MediaStore API for Android 16 compatibility.',
-      codeSnippet: `// Android 16 Scoped Storage Implementation
-ContentValues values = new ContentValues();
-values.put(MediaStore.MediaColumns.DISPLAY_NAME, "users.csv");
-values.put(MediaStore.MediaColumns.MIME_TYPE, "text/csv");
-Uri uri = getContentResolver().insert(MediaStore.Files.getContentUri("external"), values);`,
-      status: 'applied'
-    },
-    {
-      title: 'USB Permission Flow',
-      description: 'Modernized USB permission request using PendingIntent with FLAG_MUTABLE.',
-      codeSnippet: `// Android 16 USB Permission
-PendingIntent permissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(ACTION_USB_PERMISSION), 
-    PendingIntent.FLAG_MUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-usbManager.requestPermission(device, permissionIntent);`,
-      status: 'applied'
-    },
-    {
-      title: 'S24 Ultra Driver Patch',
-      description: 'Optimized serial communication timing for Snapdragon 8 Gen 3 chipsets.',
-      codeSnippet: `// S24U Serial Timing Fix
-serialPort.setParameters(115200, 8, 1, 0);
-serialPort.setFlowControl(UsbSerialPort.FLOW_CONTROL_OFF);
-// Add 5ms delay for buffer stability on high-speed USB
-Thread.sleep(5);`,
-      status: 'applied'
-    }
-  ];
+  const addLog = (message: string) => {
+    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
+  };
 
   useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      const data = await fetchDMRUsers();
-      setUsers(data);
-      setLoading(false);
-    };
-    loadData();
-
-    // Listen for USB disconnects
-    const handleDisconnect = (event: any) => {
-      console.log('USB Device disconnected:', event.device);
-      setDevice(prev => ({
-        ...prev,
-        connected: false
-      }));
-    };
-
-    const usb = (navigator as any).usb;
-    if (usb) {
-      usb.addEventListener('disconnect', handleDisconnect);
+    if (consoleRef.current) {
+      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
     }
+  }, [logs]);
 
-    return () => {
-      if (usb) {
-        usb.removeEventListener('disconnect', handleDisconnect);
-      }
-    };
-  }, []);
+  const toggleMod = (id: string) => {
+    setMods(prev => prev.map(mod => mod.id === id ? { ...mod, enabled: !mod.enabled } : mod));
+  };
 
-  const handleConnect = async () => {
-    setLoading(true);
-    const success = await requestDevice();
+  const handlePatch = async () => {
+    setIsPatching(true);
+    setPatchedFirmware(null);
+    const selectedModIds = mods.filter(m => m.enabled).map(m => m.id);
+    
+    const result = await patchFirmware(baseFirmware, selectedModIds, addLog);
+    
+    if (result) {
+      setPatchedFirmware(result);
+      addLog('Firmware patched successfully. You can now save or flash it.');
+    } else {
+      addLog('Error: Patching failed.');
+    }
+    setIsPatching(false);
+  };
+
+  const handleSave = () => {
+    if (!patchedFirmware) return;
+    
+    const blob = new Blob([patchedFirmware], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `UVMOD_Patched_${radioModel}_${new Date().toISOString().split('T')[0]}.bin`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    addLog('Firmware saved to disk.');
+  };
+
+  const handleFlash = async () => {
+    if (!patchedFirmware) {
+      addLog('Error: No patched firmware to flash. Patch first!');
+      return;
+    }
+    
+    setIsFlashing(true);
+    setFlashProgress(0);
+    
+    const success = await flashFirmware(patchedFirmware, addLog, setFlashProgress);
+    
     if (success) {
-      setDevice({
-        ...device,
-        connected: true,
-        firmware: 'D013.020 (Patched v2.0)',
-        lastSync: new Date().toLocaleString()
-      });
-    }
-    setLoading(false);
-  };
-
-  const handleFlash = async (firmwareName: string, url?: string) => {
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    if (!url) {
-      alert(`Direct flashing for ${firmwareName} is not supported. Please download the binary manually and use the "Upload Custom Firmware" button.`);
-      return;
-    }
-
-    setFlashing(true);
-    setFlashProgress(0);
-    
-    let firmwareBuffer: Uint8Array;
-    try {
-      let fetchUrl = url;
-      // Automatically convert github.com/user/repo/blob/master/file.bin to raw.githubusercontent.com/...
-      if (fetchUrl.includes('github.com') && fetchUrl.includes('/blob/')) {
-        fetchUrl = fetchUrl.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
-      }
-
-      console.log(`Fetching firmware from ${fetchUrl}...`);
-      const response = await fetch(fetchUrl);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const arrayBuffer = await response.arrayBuffer();
-      firmwareBuffer = new Uint8Array(arrayBuffer);
-    } catch (error) {
-      console.error('Failed to fetch firmware:', error);
-      alert(`Could not download ${firmwareName} automatically due to browser security (CORS) or network issues.\n\nPlease download the file manually using the link provided, then use the "Upload Custom Firmware" button at the bottom of the page.`);
-      setFlashing(false);
-      return;
-    }
-
-    // Apply Android 16 timing patch if enabled
-    if (android16Mode) {
-      console.log('Android 16 Compatibility Mode: Applying 5ms serial buffer delay...');
-    }
-
-    const success = await flashFirmware(firmwareBuffer, (progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
-
-    if (success) {
-      setDevice({
-        ...device,
-        connected: false,
-        firmware: firmwareName,
-        lastSync: new Date().toLocaleString()
-      });
-      alert(`Successfully flashed ${firmwareName}! The radio is now restarting.`);
+      addLog('Flashing successful!');
     } else {
-      alert('Flashing failed. Please check your connection.');
+      addLog('Flashing failed. Check connection and try again.');
     }
     
-    setFlashing(false);
+    setIsFlashing(false);
   };
 
-  const handleCustomFlash = async () => {
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-    if (!selectedFile) {
-      alert('Please select a firmware file first.');
-      return;
-    }
-
-    setFlashing(true);
-    setFlashProgress(0);
-
-    try {
-      const firmwareBuffer = await uploadFirmwareFile(selectedFile);
-      const success = await flashFirmware(firmwareBuffer, (progress) => {
-        setFlashProgress(progress);
-      }, android16Mode);
-
-      if (success) {
-        setDevice({
-          ...device,
-          connected: false,
-          firmware: selectedFile.name,
-          lastSync: new Date().toLocaleString()
-        });
-        alert(`Successfully flashed ${selectedFile.name}! The radio is now restarting.`);
-      } else {
-        alert('Flashing failed. Please check your connection.');
-      }
-    } catch (error) {
-      console.error('Failed to read firmware file:', error);
-      alert('Failed to read firmware file.');
-    }
-
-    setFlashing(false);
-  };
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (event.target.files && event.target.files.length > 0) {
-      setSelectedFile(event.target.files[0]);
-    }
-  };
-
-  const handleReadFirmware = async () => {
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    setReading(true);
-    setFlashProgress(0);
-
-    let firmwareData;
-    try {
-      firmwareData = await readFirmware((progress) => {
-        setFlashProgress(progress);
-      }, android16Mode);
-    } catch (error) {
-      console.error('Firmware Reading Error:', error);
-      alert(`Firmware Reading Error: ${error instanceof Error ? error.message : String(error)}`);
-      setReading(false);
-      setFlashProgress(0);
-      return;
-    }
-
-    if (firmwareData) {
-      // Create a blob and download it
-      const blob = new Blob([firmwareData], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `MD380_Firmware_Backup_${new Date().toISOString().split('T')[0]}.bin`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
-      setDevice({
-        ...device,
-        connected: false, // Device reboots after DFU
-        lastSync: new Date().toLocaleString()
-      });
-      alert('Successfully read firmware! The backup has been downloaded and the radio is restarting.');
-    } else {
-      alert('Failed to read firmware. Please check your connection.');
-    }
-
-    setReading(false);
-  };
-
-  const handleReadCodeplug = async () => {
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    setReading(true);
-    setFlashProgress(0);
-
-    const codeplugData = await readCodeplug((progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
-
-    if (codeplugData) {
-      const blob = new Blob([codeplugData], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `MD380_Codeplug_${new Date().toISOString().split('T')[0]}.rdt`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
-      setDevice({
-        ...device,
-        connected: false,
-        lastSync: new Date().toLocaleString()
-      });
-      alert('Successfully read codeplug! The backup has been downloaded and the radio is restarting.');
-    } else {
-      alert('Failed to read codeplug. Please check your connection.');
-    }
-
-    setReading(false);
-  };
-
-  const handleWriteCodeplugSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
-
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    const buffer = await selectedFile.arrayBuffer();
-    const codeplugBuffer = new Uint8Array(buffer);
-
-    if (codeplugBuffer.length !== 262144) {
-      alert(`Invalid codeplug file size. Expected 262144 bytes, got ${codeplugBuffer.length} bytes.`);
-      return;
-    }
-
-    setFlashing(true);
-    setFlashProgress(0);
-
-    const success = await writeCodeplug(codeplugBuffer, (progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
-
-    if (success) {
-      setDevice({
-        ...device,
-        connected: false,
-        lastSync: new Date().toLocaleString()
-      });
-      alert(`Successfully wrote codeplug ${selectedFile.name}! The radio is now restarting.`);
-    } else {
-      alert('Failed to write codeplug. Please check your connection.');
-    }
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     
-    setFlashing(false);
-    
-    if (codeplugInputRef.current) {
-      codeplugInputRef.current.value = '';
-    }
+    const buffer = await file.arrayBuffer();
+    setBaseFirmware(new Uint8Array(buffer));
+    setUseDefaultFirmware(false);
+    addLog(`Custom firmware loaded: ${file.name} (${file.size} bytes)`);
   };
-
-  const [dbFile, setDbFile] = useState<File | null>(null);
-  const [dbFileData, setDbFileData] = useState<Uint8Array | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const customFirmwareInputRef = useRef<HTMLInputElement>(null);
-
-  const handleCustomFirmwareSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
-
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    const buffer = await selectedFile.arrayBuffer();
-    const firmwareBuffer = new Uint8Array(buffer);
-
-    setFlashing(true);
-    setFlashProgress(0);
-    
-    // Apply Android 16 timing patch if enabled
-    if (android16Mode) {
-      console.log('Android 16 Compatibility Mode: Applying 5ms serial buffer delay...');
-    }
-
-    const success = await flashFirmware(firmwareBuffer, (progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
-
-    if (success) {
-      setDevice({
-        ...device,
-        connected: false,
-        firmware: selectedFile.name,
-        lastSync: new Date().toLocaleString()
-      });
-      alert(`Successfully flashed ${selectedFile.name}! The radio is now restarting.`);
-    } else {
-      alert('Flashing failed. Please check your connection.');
-    }
-    
-    setFlashing(false);
-    
-    // Reset the input so the same file can be selected again if needed
-    if (customFirmwareInputRef.current) {
-      customFirmwareInputRef.current.value = '';
-    }
-  };
-
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      setDbFile(selectedFile);
-      const buffer = await selectedFile.arrayBuffer();
-      setDbFileData(new Uint8Array(buffer));
-    }
-  };
-
-  const handleFlashDatabase = async () => {
-    if (!device.connected) {
-      alert('Please connect your radio first.');
-      setActiveTab('device');
-      return;
-    }
-
-    if (!dbFileData) {
-      alert('Please select a users.bin database file first.');
-      return;
-    }
-
-    setFlashing(true);
-    setFlashProgress(0);
-    
-    if (android16Mode) {
-      console.log('Android 16 Compatibility Mode: Applying 50ms SPI buffer delay...');
-    }
-
-    const success = await flashDatabase(dbFileData, (progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
-
-    if (success) {
-      setDevice({
-        ...device,
-        connected: false,
-        lastSync: new Date().toLocaleString()
-      });
-      alert('Successfully flashed the User Database! The radio is now restarting.');
-    } else {
-      alert('Database flashing failed. Please check your connection.');
-    }
-    
-    setFlashing(false);
-  };
-
-  const filteredUsers = users.filter(u => 
-    u.callsign.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    u.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    u.id.toString().includes(searchQuery)
-  );
-
-  const statsData = [
-    { name: 'USA', count: 1200 },
-    { name: 'UK', count: 800 },
-    { name: 'Germany', count: 600 },
-    { name: 'France', count: 450 },
-    { name: 'Japan', count: 300 },
-  ];
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#121212] text-[#e4e3e0]">
-      {/* Sidebar */}
-      <aside className={cn("border-r border-[#333333] flex flex-col transition-all duration-300", isSidebarCollapsed ? "w-20" : "w-64")}>
-        <div className="p-6 border-b border-[#333333] flex items-center justify-between">
-          <div className={cn("flex items-center gap-3", isSidebarCollapsed && "justify-center w-full")}>
-            <Radio className="w-6 h-6 text-[#ffb000] shrink-0" />
-            {!isSidebarCollapsed && <h1 className="text-lg font-bold tracking-tighter uppercase">MD380 Tool</h1>}
+    <div className="flex h-screen overflow-hidden bg-[#E4E3E0] text-[#141414] font-sans">
+      {/* Sidebar - Visible Grid Structure */}
+      <aside className="w-80 border-r border-[#141414] flex flex-col bg-[#E4E3E0]">
+        <div className="p-8 border-b border-[#141414]">
+          <div className="flex items-center gap-3 mb-2">
+            <Radio className="w-8 h-8" strokeWidth={1.5} />
+            <h1 className="text-3xl font-bold tracking-tighter italic font-serif">UVMOD RX-TX</h1>
           </div>
-          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-1 hover:bg-[#1a1a1a] rounded shrink-0">
-             {isSidebarCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
-          </button>
+          <p className="text-[11px] uppercase tracking-widest opacity-50 font-mono">Quansheng Firmware Patcher</p>
         </div>
 
-        {!isSidebarCollapsed && (
-          <div className="px-6 py-2">
-            <p className="text-[10px] uppercase tracking-widest opacity-50">Web Management Suite</p>
+        <div className="flex-1 overflow-y-auto">
+          <div className="p-4 border-b border-[#141414] bg-[#141414] text-[#E4E3E0]">
+            <h2 className="text-xs uppercase tracking-widest font-mono font-bold">Available Mods</h2>
           </div>
-        )}
-
-        <nav className="flex-1 py-4">
-          {[
-            { id: 'device', icon: Usb, label: 'Device Status' },
-            { id: 'features', icon: Activity, label: 'Features' },
-            { id: 'database', icon: Database, label: 'User Database' },
-            { id: 'firmware', icon: Cpu, label: 'Firmware' },
-            { id: 'codeplug', icon: FileText, label: 'Codeplug (.rdt)' },
-            { id: 'android', icon: Smartphone, label: 'Android 16 Patch' },
-            { id: 'resources', icon: Info, label: 'Resources' },
-          ].map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setActiveTab(item.id as any)}
-              title={isSidebarCollapsed ? item.label : undefined}
+          
+          {mods.map((mod) => (
+            <div 
+              key={mod.id}
+              onClick={() => toggleMod(mod.id)}
               className={cn(
-                "w-full flex items-center gap-3 px-6 py-3 text-sm font-medium transition-colors",
-                isSidebarCollapsed && "justify-center px-0",
-                activeTab === item.id 
-                  ? "bg-[#ffb000] text-[#121212]" 
-                  : "hover:bg-[#1a1a1a] text-[#e4e3e0]/70"
+                "group p-4 border-b border-[#141414] cursor-pointer transition-all duration-200",
+                mod.enabled ? "bg-[#141414] text-[#E4E3E0]" : "hover:bg-[#141414]/5"
               )}
             >
-              <item.icon className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && item.label}
-            </button>
+              <div className="flex items-center justify-between mb-1">
+                <span className="font-serif italic text-lg">{mod.name}</span>
+                <div className={cn(
+                  "w-4 h-4 border border-[#141414] flex items-center justify-center",
+                  mod.enabled ? "bg-[#E4E3E0] border-[#E4E3E0]" : ""
+                )}>
+                  {mod.enabled && <CheckCircle2 className="w-3 h-3 text-[#141414]" />}
+                </div>
+              </div>
+              <p className={cn(
+                "text-xs leading-relaxed",
+                mod.enabled ? "opacity-70" : "opacity-50"
+              )}>
+                {mod.description}
+              </p>
+              <div className="mt-2 flex gap-2">
+                <span className={cn(
+                  "text-[9px] uppercase px-1.5 py-0.5 border",
+                  mod.enabled ? "border-[#E4E3E0]/30 text-[#E4E3E0]/70" : "border-[#141414]/30 text-[#141414]/50"
+                )}>
+                  {mod.category}
+                </span>
+              </div>
+            </div>
           ))}
-        </nav>
+        </div>
 
-        <div className="p-6 border-t border-[#333333]">
-          {!isSidebarCollapsed && (
-            <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest opacity-50 mb-4">
-              <Settings className="w-3 h-3" />
-              System Config
-            </div>
-          )}
-          {!isSidebarCollapsed && (
-            <div className="space-y-2 mb-4">
-              <div className="flex justify-between text-[11px]">
-                <span>API Status</span>
-                <span className="text-emerald-500">ONLINE</span>
-              </div>
-              <div className="flex justify-between text-[11px]">
-                <span>WebUSB</span>
-                <span className="text-emerald-500">SUPPORTED</span>
-              </div>
-            </div>
-          )}
-          <a 
-            href="https://github.com/RE3CON/MD380Tool-Android-16" 
-            target="_blank" 
-            rel="noreferrer"
-            title={isSidebarCollapsed ? "View on GitHub" : undefined}
-            className={cn("flex items-center gap-2 text-xs text-[#e4e3e0]/70 hover:text-[#ffb000] transition-colors", isSidebarCollapsed && "justify-center")}
+        <div className="p-6 border-t border-[#141414] bg-[#141414]/5">
+          <button 
+            onClick={() => setShowInstructions(!showInstructions)}
+            className="w-full flex items-center justify-between text-xs font-mono uppercase tracking-widest hover:opacity-70"
           >
-            <Github className="w-4 h-4 shrink-0" />
-            {!isSidebarCollapsed && "View on GitHub"}
-          </a>
+            <span>Instructions</span>
+            {showInstructions ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+          </button>
         </div>
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col overflow-hidden">
+      <main className="flex-1 flex flex-col overflow-hidden relative">
         {/* Header */}
-        <header className="h-16 border-b border-[#333333] flex items-center justify-between px-8">
-          <div className="flex items-center gap-4">
-            <Activity className="w-4 h-4 text-[#ffb000]" />
-            <span className="text-xs font-mono uppercase tracking-widest opacity-50">
-              {activeTab === 'device' && 'Hardware Interface v1.0.4'}
-              {activeTab === 'features' && 'MD380Tools Enhanced Feature Set'}
-              {activeTab === 'database' && 'DMR User Registry Sync'}
-              {activeTab === 'firmware' && 'Binary Management & Flashing'}
-              {activeTab === 'codeplug' && 'Codeplug Configuration'}
-              {activeTab === 'android' && 'Mobile Compatibility Layer'}
-              {activeTab === 'resources' && 'Documentation & Archives'}
-            </span>
+        <header className="h-20 border-b border-[#141414] flex items-center justify-between px-10">
+          <div className="flex items-center gap-8">
+            <div className="flex flex-col">
+              <span className="text-[10px] uppercase tracking-widest opacity-50 font-mono">Target Model</span>
+              <select 
+                value={radioModel}
+                onChange={(e) => setRadioModel(e.target.value)}
+                className="bg-transparent border-none font-serif italic text-xl focus:ring-0 p-0 cursor-pointer"
+              >
+                <option value="*">Patch for all radios</option>
+                <option value="2">Patch for UV-K5</option>
+                <option value="3">Patch for UV-K6, UV-K5(8)</option>
+                <option value="4">Patch for UV-5R Plus</option>
+              </select>
+            </div>
+            
+            <div className="h-8 w-px bg-[#141414]/20" />
+            
+            <div className="flex flex-col">
+              <span className="text-[10px] uppercase tracking-widest opacity-50 font-mono">Base Firmware</span>
+              <div className="flex items-center gap-2">
+                <span className="font-serif italic text-xl">{useDefaultFirmware ? 'Stock v2.01.26' : 'Custom Upload'}</span>
+                <button 
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-1 hover:bg-[#141414]/5 rounded"
+                >
+                  <FileUp className="w-4 h-4" />
+                </button>
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  className="hidden" 
+                  onChange={handleFileChange}
+                  accept=".bin"
+                />
+              </div>
+            </div>
           </div>
+
           <div className="flex items-center gap-4">
-            {device.connected ? (
-              <div className="flex items-center gap-2 px-3 py-1 bg-emerald-500/10 border border-emerald-500/30 rounded text-emerald-500 text-[10px] font-bold uppercase">
-                <CheckCircle2 className="w-3 h-3" />
-                Connected: {device.model}
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 px-3 py-1 bg-red-500/10 border border-red-500/30 rounded text-red-500 text-[10px] font-bold uppercase">
-                <AlertCircle className="w-3 h-3" />
-                Disconnected
-              </div>
-            )}
+            <a href="https://github.com/RE3CON" target="_blank" rel="noreferrer" className="p-2 hover:bg-[#141414]/5 rounded-full">
+              <Github className="w-5 h-5" />
+            </a>
           </div>
         </header>
 
         {/* Content Area */}
-        <div className="flex-1 overflow-y-auto p-8 relative">
-          <AnimatePresence>
-            {(flashing || reading) && (
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="absolute inset-0 z-50 bg-[#121212]/90 backdrop-blur-sm flex flex-col items-center justify-center p-8 text-center"
-              >
-                <div className="w-full max-w-md space-y-6">
-                  <div className="relative w-32 h-32 mx-auto">
-                    <Cpu className="w-full h-full text-[#ffb000] animate-pulse" />
-                    <div className="absolute inset-0 border-4 border-[#ffb000]/20 rounded-full animate-ping" />
-                  </div>
-                  <div className="space-y-2">
-                    <h2 className="text-2xl font-bold tracking-tight">{reading ? 'Reading Firmware...' : 'Flashing Firmware...'}</h2>
-                    <p className="text-sm opacity-60 italic">Do not disconnect your radio or close this tab.</p>
-                  </div>
-                  <div className="w-full bg-[#333333] h-2 rounded-full overflow-hidden">
-                    <motion.div 
-                      className="bg-[#ffb000] h-full"
-                      initial={{ width: 0 }}
-                      animate={{ width: `${flashProgress}%` }}
-                    />
-                  </div>
-                  <div className="flex justify-between text-[10px] font-mono uppercase tracking-widest text-[#ffb000]">
-                    <span>{Math.round(flashProgress)}% Complete</span>
-                    <span>{reading ? 'Reading Blocks...' : 'Writing Blocks...'}</span>
-                  </div>
+        <div className="flex-1 p-10 overflow-y-auto">
+          <div className="max-w-4xl mx-auto space-y-10">
+            
+            {/* Action Cards */}
+            <div className="grid grid-cols-2 gap-10">
+              <div className="border border-[#141414] p-8 flex flex-col justify-between group hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors duration-300">
+                <div>
+                  <Wrench className="w-10 h-10 mb-6" strokeWidth={1} />
+                  <h3 className="text-3xl font-serif italic mb-4">Patch Firmware</h3>
+                  <p className="text-sm opacity-70 mb-8 leading-relaxed">
+                    Apply the selected mods to your base firmware. This will generate a new binary file ready for flashing.
+                  </p>
                 </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+                <button 
+                  onClick={handlePatch}
+                  disabled={isPatching}
+                  className="w-full border border-current py-4 font-mono uppercase tracking-widest text-sm hover:bg-[#E4E3E0] hover:text-[#141414] transition-colors disabled:opacity-50"
+                >
+                  {isPatching ? 'Patching...' : 'Execute Patch'}
+                </button>
+              </div>
 
-          <AnimatePresence mode="wait">
-            {activeTab === 'device' && (
-              <motion.div
-                key="device"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="grid grid-cols-3 gap-6">
-                  <div className="widget-container p-6 col-span-2">
-                    <h3 className="text-lg font-bold mb-6 flex items-center gap-2">
-                      <Usb className="w-5 h-5 text-[#ffb000]" />
-                      Radio Connection
-                    </h3>
-                    <div className="flex items-center justify-between p-8 border border-dashed border-[#333333] rounded-lg bg-[#121212]">
-                      <div className="space-y-2">
-                        <p className="text-sm opacity-70">Connect your Tytera MD-380 via USB cable and put it in DFU mode (PTT + Top Button while powering on).</p>
-                        <p className="text-[10px] font-mono text-[#ffb000]">READY FOR WEBUSB HANDSHAKE</p>
-                      </div>
-                      <button 
-                        onClick={handleConnect}
-                        disabled={loading || device.connected}
-                        className="btn-primary flex items-center gap-2 disabled:opacity-50"
-                      >
-                        {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Usb className="w-4 h-4" />}
-                        {device.connected ? 'Device Paired' : 'Connect Radio'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6">
-                    <h3 className="text-lg font-bold mb-6 flex items-center gap-2">
-                      <Activity className="w-5 h-5 text-[#ffb000]" />
-                      Status
-                    </h3>
-                    <div className="space-y-4">
-                      <div className="pb-4 border-b border-[#333333]">
-                        <p className="text-[10px] uppercase opacity-50 mb-1">Model</p>
-                        <p className="font-mono text-sm">{device.model}</p>
-                      </div>
-                      <div className="pb-4 border-b border-[#333333]">
-                        <p className="text-[10px] uppercase opacity-50 mb-1">Firmware</p>
-                        <p className="font-mono text-sm">{device.firmware}</p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] uppercase opacity-50 mb-1">Last Sync</p>
-                        <p className="font-mono text-sm">{device.lastSync || 'Never'}</p>
-                      </div>
-                    </div>
-                  </div>
+              <div className="border border-[#141414] p-8 flex flex-col justify-between group hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors duration-300">
+                <div>
+                  <Usb className="w-10 h-10 mb-6" strokeWidth={1} />
+                  <h3 className="text-3xl font-serif italic mb-4">Direct Flashing</h3>
+                  <p className="text-sm opacity-70 mb-8 leading-relaxed">
+                    Flash the patched firmware directly to your radio using the Web Serial API. No external tools required.
+                  </p>
                 </div>
+                <button 
+                  onClick={handleFlash}
+                  disabled={!patchedFirmware || isFlashing}
+                  className="w-full border border-current py-4 font-mono uppercase tracking-widest text-sm hover:bg-[#E4E3E0] hover:text-[#141414] transition-colors disabled:opacity-50"
+                >
+                  {isFlashing ? 'Flashing...' : 'Flash Directly'}
+                </button>
+              </div>
+            </div>
 
-                <div className="widget-container p-6">
-                  <h3 className="text-lg font-bold mb-6">Regional Distribution</h3>
-                  <div className="w-full h-[300px] relative overflow-hidden">
-                    <ResponsiveContainer id="regional-distribution-chart" width="99%" height={300} minWidth={0} minHeight={0}>
-                      <BarChart data={statsData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#333333" vertical={false} />
-                        <XAxis 
-                          dataKey="name" 
-                          stroke="#e4e3e0" 
-                          fontSize={10} 
-                          tickLine={false} 
-                          axisLine={false}
-                          dy={10}
-                        />
-                        <YAxis 
-                          stroke="#e4e3e0" 
-                          fontSize={10} 
-                          tickLine={false} 
-                          axisLine={false}
-                        />
-                        <Tooltip 
-                          contentStyle={{ backgroundColor: '#1a1a1a', border: '1px solid #333333', fontSize: '12px' }}
-                          itemStyle={{ color: '#ffb000' }}
-                          cursor={{ fill: '#ffffff05' }}
-                        />
-                        <Bar dataKey="count" radius={[4, 4, 0, 0]}>
-                          {statsData.map((entry, index) => (
-                            <Cell key={`cell-${index}`} fill={index === 0 ? '#ffb000' : '#444444'} />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
+            {/* Console Section */}
+            <div className="border border-[#141414]">
+              <div className="flex items-center justify-between px-6 py-3 border-b border-[#141414] bg-[#141414] text-[#E4E3E0]">
+                <div className="flex items-center gap-2">
+                  <Terminal className="w-4 h-4" />
+                  <span className="text-xs font-mono uppercase tracking-widest font-bold">System Console</span>
                 </div>
-              </motion.div>
-            )}
+                <button 
+                  onClick={handleSave}
+                  disabled={!patchedFirmware}
+                  className="flex items-center gap-2 text-[10px] uppercase tracking-widest hover:opacity-70 disabled:opacity-30"
+                >
+                  <Download className="w-3 h-3" />
+                  Save Binary
+                </button>
+              </div>
+              <textarea 
+                ref={consoleRef}
+                readOnly
+                value={logs.join('\n')}
+                className="w-full h-64 bg-transparent p-6 font-mono text-xs leading-relaxed focus:ring-0 border-none resize-none"
+              />
+            </div>
 
-            {activeTab === 'features' && (
-              <motion.div
-                key="features"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Settings className="w-5 h-5 text-[#ffb000]" />
-                      Application Menu
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      A custom menu system accessible directly from the radio's keypad. 
-                      Allows for real-time configuration of experimental features without a PC.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Access: Red Button + Menu
-                    </div>
-                  </div>
+            {/* Warning Section */}
+            <div className="border border-[#141414] p-6 bg-[#141414]/5 flex gap-6 items-start">
+              <ShieldAlert className="w-6 h-6 shrink-0 mt-1" />
+              <div className="space-y-2">
+                <h4 className="text-xs font-mono uppercase tracking-widest font-bold">Legal Warning</h4>
+                <p className="text-xs opacity-70 leading-relaxed">
+                  Check your local laws! In some countries you need a HAM license to operate and/or freq radiation protected environment. Use a Dummyload (50 Ohm, 5W) on frequencies for testing TX before going On-Air. 73, 55 R3CøN.
+                </p>
+              </div>
+            </div>
 
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Activity className="w-5 h-5 text-[#ffb000]" />
-                      Promiscuous Mode
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Listen to all traffic on the current time slot, regardless of Talkgroup or Color Code. 
-                      Essential for monitoring busy repeaters or finding active traffic.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Status: Toggle via Menu
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Activity className="w-5 h-5 text-[#ffb000]" />
-                      Network Monitor
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Real-time display of DMR network activity. Shows active Talkgroups, 
-                      Caller IDs, and signal strength in a dedicated monitoring view.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      View: NetMon 1, 2, and 3
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Users className="w-5 h-5 text-[#ffb000]" />
-                      Caller ID (users.bin Database)
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Displays the name, callsign, and location of the person talking by 
-                      matching their DMR ID against a local users.bin database stored in the radio.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Capacity: ~100,000+ Users
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <FileText className="w-5 h-5 text-[#ffb000]" />
-                      Call Log
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Maintains a history of the last received calls, including timestamps, 
-                      Talkgroups, and Caller IDs for later review.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Feature: Persistent History
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Info className="w-5 h-5 text-[#ffb000]" />
-                      Morse Narration
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Accessibility feature that narrates menu items and radio status 
-                      using Morse code audio prompts.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Target: Visually Impaired Users
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <RefreshCw className="w-5 h-5 text-[#ffb000]" />
-                      Quick TG Change
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Rapidly switch between Talkgroups without navigating the main menu. 
-                      Supports manual entry and quick-select lists.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Shortcut: Keyboard Entry
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Cpu className="w-5 h-5 text-[#ffb000]" />
-                      Test & Setup
-                    </h3>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      Advanced diagnostic tools for testing radio hardware, 
-                      calibrating mic gain, and verifying firmware integrity.
-                    </p>
-                    <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
-                      Mode: Experimental Diagnostics
-                    </div>
-                  </div>
-                </div>
-
-                <div className="widget-container p-8 bg-[#1a1a1a] border border-[#333333]">
-                  <h3 className="text-xl font-bold mb-4">How to Enable Features</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                    <div className="space-y-4">
-                      <h4 className="font-bold text-[#ffb000] uppercase text-xs tracking-widest">Step 1: Flash Firmware</h4>
-                      <p className="text-sm opacity-70">
-                        Most features require the patched community firmware (KD4Z or Travis Goodspeed builds). 
-                        Use the <button onClick={() => setActiveTab('firmware')} className="text-[#ffb000] underline">Firmware</button> tab to flash your device.
-                      </p>
-                    </div>
-                    <div className="space-y-4">
-                      <h4 className="font-bold text-[#ffb000] uppercase text-xs tracking-widest">Step 2: Configure Menu</h4>
-                      <p className="text-sm opacity-70">
-                        Once flashed, press the <strong>Red Button</strong> followed by the <strong>Menu Button</strong> on your radio 
-                        to open the "Application Menu" and toggle specific enhancements.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'database' && (
-              <motion.div
-                key="database"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-6"
-              >
-                <div className="flex items-center justify-between mb-8">
-                  <div className="relative w-96">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 opacity-30" />
-                    <input 
-                      type="text"
-                      placeholder="Search by Callsign, Name or ID..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      className="w-full bg-[#1a1a1a] border border-[#333333] rounded-md py-2 pl-10 pr-4 text-sm focus:outline-none focus:border-[#ffb000] transition-colors"
-                    />
-                  </div>
-                  <div className="flex gap-3">
-                    <input 
-                      type="file" 
-                      ref={fileInputRef}
-                      onChange={handleFileSelect}
-                      accept=".bin"
-                      className="hidden"
-                    />
-                    <button 
-                      onClick={() => fileInputRef.current?.click()}
-                      className="btn-secondary flex items-center gap-2"
-                    >
-                      <FileText className="w-4 h-4" />
-                      {dbFile ? dbFile.name : 'Select users.bin File'}
-                    </button>
-                    <button className="btn-secondary flex items-center gap-2 opacity-50 cursor-not-allowed" disabled>
-                      <Download className="w-4 h-4" />
-                      Download Latest DB
-                    </button>
-                    <button 
-                      onClick={handleFlashDatabase}
-                      disabled={flashing || !dbFileData}
-                      className="btn-primary flex items-center gap-2 disabled:opacity-50"
-                    >
-                      <Database className="w-4 h-4" />
-                      {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Flash to Radio'}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="widget-container overflow-hidden">
-                  <div className="data-row bg-[#222222] border-b-2 border-[#333333] cursor-default hover:bg-[#222222] hover:text-[#e4e3e0]">
-                    <span className="col-header">DMR ID</span>
-                    <span className="col-header">Callsign</span>
-                    <span className="col-header">Name</span>
-                    <span className="col-header">Location</span>
-                    <span className="col-header">Country</span>
-                  </div>
-                  {filteredUsers.map((user) => (
-                    <div key={user.id} className="data-row">
-                      <span className="data-value text-[#ffb000]">{user.id}</span>
-                      <span className="font-bold">{user.callsign}</span>
-                      <span className="opacity-80">{user.name}</span>
-                      <span className="opacity-60 text-xs">{user.city}, {user.state}</span>
-                      <span className="opacity-60 text-xs">{user.country}</span>
-                    </div>
-                  ))}
-                  {filteredUsers.length === 0 && (
-                    <div className="p-12 text-center opacity-30 italic">No users found matching criteria</div>
-                  )}
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'android' && (
-              <motion.div
-                key="android"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="widget-container p-8 border-l-4 border-l-[#ffb000]">
-                  <div className="flex items-start gap-4">
-                    <Info className="w-6 h-6 text-[#ffb000] shrink-0" />
-                    <div>
-                      <h2 className="text-xl font-bold mb-2">Android 16 & S24 Ultra Compatibility</h2>
-                      <p className="text-sm opacity-70 leading-relaxed">
-                        The latest Android versions introduce strict Scoped Storage and USB permission requirements. 
-                        The S24 Ultra specifically requires optimized serial buffer handling due to its high-speed USB implementation.
-                        Apply the patches below to your Android source code to ensure full compatibility.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 gap-6">
-                  {androidPatches.map((patch, idx) => (
-                    <div key={idx} className="widget-container p-6">
-                      <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center gap-3">
-                          <div className="w-8 h-8 rounded bg-[#ffb000]/10 flex items-center justify-center text-[#ffb000] font-bold">
-                            {idx + 1}
-                          </div>
-                          <h3 className="font-bold">{patch.title}</h3>
-                        </div>
-                        <span className="text-[10px] font-bold uppercase px-2 py-1 bg-emerald-500/10 text-emerald-500 rounded border border-emerald-500/30">
-                          {patch.status}
-                        </span>
-                      </div>
-                      <p className="text-sm opacity-60 mb-4">{patch.description}</p>
-                      <div className="bg-[#0a0a0a] p-4 rounded font-mono text-xs overflow-x-auto border border-[#333333]">
-                        <pre className="text-emerald-400">
-                          {patch.codeSnippet}
-                        </pre>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'codeplug' && (
-              <motion.div
-                key="codeplug"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="widget-container p-8">
-                  <div className="flex items-center gap-4 mb-6">
-                    <FileText className="w-8 h-8 text-[#ffb000]" />
-                    <div>
-                      <h2 className="text-xl font-bold">Codeplug Management</h2>
-                      <p className="text-sm opacity-60">Read and write the radio's configuration (Channels, Zones, Contacts).</p>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div className="p-6 border border-emerald-500/50 rounded-lg bg-[#1a1a1a] hover:border-emerald-500 transition-colors group relative overflow-hidden">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-emerald-400 text-lg">Read Codeplug</h3>
-                      </div>
-                      <p className="text-sm opacity-70 mb-6">Download the current codeplug from your radio and save it as an .rdt file on your computer.</p>
-                      <button 
-                        onClick={handleReadCodeplug}
-                        disabled={reading || flashing}
-                        className="btn-primary bg-emerald-500 hover:bg-emerald-600 text-black text-xs py-2 px-6 disabled:opacity-50"
-                      >
-                        {reading ? `Reading ${Math.round(flashProgress)}%` : 'Read from Radio'}
-                      </button>
-                    </div>
-
-                    <div className="p-6 border border-[#ffb000]/50 rounded-lg bg-[#1a1a1a] hover:border-[#ffb000] transition-colors group relative overflow-hidden">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-[#ffb000] text-lg">Write Codeplug</h3>
-                      </div>
-                      <p className="text-sm opacity-70 mb-6">Upload an .rdt codeplug file from your computer and write it to the radio's memory.</p>
-                      <input 
-                        type="file" 
-                        ref={codeplugInputRef} 
-                        onChange={handleWriteCodeplugSelect} 
-                        accept=".rdt,.bin" 
-                        className="hidden" 
-                      />
-                      <button 
-                        onClick={() => codeplugInputRef.current?.click()}
-                        disabled={reading || flashing}
-                        className="btn-primary text-xs py-2 px-6 disabled:opacity-50"
-                      >
-                        {flashing ? `Writing ${Math.round(flashProgress)}%` : 'Write to Radio'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'firmware' && (
-              <motion.div
-                key="firmware"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="widget-container p-8">
-                  <div className="flex items-center gap-4 mb-6">
-                    <Cpu className="w-8 h-8 text-[#ffb000]" />
-                    <div>
-                      <h2 className="text-xl font-bold">Firmware Management</h2>
-                      <p className="text-sm opacity-60">Select a firmware binary to flash to your MD-380 device.</p>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-6">
-                    <div className="p-6 border border-emerald-500/50 rounded-lg bg-[#1a1a1a] hover:border-emerald-500 transition-colors group relative overflow-hidden">
-                      <div className="absolute top-0 right-0 bg-emerald-500 text-black text-[10px] font-bold px-3 py-1 rounded-bl-lg uppercase tracking-tighter">
-                        Recommended
-                      </div>
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-emerald-400 text-lg">Backup Current Firmware</h3>
-                      </div>
-                      <p className="text-sm opacity-70 mb-6">Read the current firmware from your radio and save it as a .bin file. Always do this before flashing a new version.</p>
-                      <div className="flex gap-3">
-                        <button 
-                          onClick={handleReadFirmware}
-                          disabled={reading || flashing}
-                          className="btn-primary bg-emerald-500 hover:bg-emerald-600 text-black text-xs py-2 px-6 disabled:opacity-50"
-                        >
-                          {reading ? `Reading ${Math.round(flashProgress)}%` : 'Read Firmware'}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="p-6 border border-[#ffb000] rounded-lg bg-[#1a1a1a] hover:bg-[#222222] transition-colors group relative overflow-hidden">
-                      <div className="absolute top-0 right-0 bg-[#ffb000] text-black text-[10px] font-bold px-3 py-1 rounded-bl-lg uppercase tracking-tighter">
-                        Latest Working Build
-                      </div>
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-[#ffb000] text-lg">Foxhollow Experimental (2025)</h3>
-                        <span className="text-[10px] opacity-50 font-mono">Released: 2025-01-13</span>
-                      </div>
-                      <p className="text-sm opacity-70 mb-6">The most up-to-date experimental firmware (v2025-01-13). Includes all latest patches, DMR database support, and UI enhancements.</p>
-                      <div className="flex gap-3">
-                        <button 
-                          onClick={() => handleFlash('Foxhollow Experimental (2025)')}
-                          disabled={flashing}
-                          className="btn-primary text-xs py-2 px-6 disabled:opacity-50"
-                        >
-                          {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Flash Latest'}
-                        </button>
-                        <a 
-                          href="https://web1.foxhollow.ca/DMR/TYT/Firmware/Experimental/" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-secondary text-xs py-2 flex items-center gap-1"
-                        >
-                          <Download className="w-3 h-3" /> Directory
-                        </a>
-                      </div>
-                    </div>
-
-                    <div className="p-6 border border-[#333333] rounded-lg bg-[#1a1a1a] hover:border-[#ffb000] transition-colors group">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-[#ffb000]">KD4Z md380tools (Non-GPS)</h3>
-                        <div className="text-right">
-                          <span className="text-[10px] bg-[#ffb000]/10 text-[#ffb000] px-2 py-1 rounded font-bold uppercase block mb-1">Community Stable</span>
-                          <span className="text-[9px] opacity-40 font-mono">Released: 2024-11-20</span>
-                        </div>
-                      </div>
-                      <p className="text-xs opacity-60 mb-6">The definitive community firmware with promiscuous mode, mic gain, and enhanced UI. Highly stable for daily use.</p>
-                      <div className="flex gap-3">
-                        <button 
-                          onClick={() => handleFlash('KD4Z md380tools (Non-GPS)', 'https://raw.githubusercontent.com/DMR-Database/md380tools/master/firmware-noGPS.bin')}
-                          disabled={flashing}
-                          className="btn-primary text-xs py-2 disabled:opacity-50"
-                        >
-                          {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Flash Now'}
-                        </button>
-                        <a 
-                          href="https://github.com/DMR-Database/md380tools/blob/master/firmware-noGPS.bin" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-secondary text-xs py-2 flex items-center gap-1"
-                        >
-                          <Download className="w-3 h-3" /> Source
-                        </a>
-                      </div>
-                    </div>
-
-                    <div className="p-6 border border-[#333333] rounded-lg bg-[#1a1a1a] hover:border-[#ffb000] transition-colors group">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-[#ffb000]">Custom Firmware Upload</h3>
-                        <span className="text-[10px] opacity-50 font-mono">.bin file</span>
-                      </div>
-                      <p className="text-xs opacity-60 mb-6">Upload your own firmware binary file. Ensure it is compatible with your radio model.</p>
-                      <div className="flex flex-col gap-3">
-                        <input 
-                          type="file" 
-                          accept=".bin" 
-                          onChange={handleFileChange}
-                          className="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-[#333333] file:text-white hover:file:bg-[#444444]"
-                        />
-                        <button 
-                          onClick={handleCustomFlash}
-                          disabled={flashing || !selectedFile}
-                          className="btn-primary text-xs py-2 disabled:opacity-50"
-                        >
-                          {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Flash Custom File'}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="p-6 border border-[#333333] rounded-lg bg-[#1a1a1a] hover:border-indigo-500 transition-colors group">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-indigo-400">OpenRTX (Alternative)</h3>
-                        <div className="text-right">
-                          <span className="text-[10px] bg-indigo-500/10 text-indigo-400 px-2 py-1 rounded font-bold uppercase block mb-1">Open Source</span>
-                          <span className="text-[9px] opacity-40 font-mono">Released: 2025-02-01</span>
-                        </div>
-                      </div>
-                      <p className="text-xs opacity-60 mb-6">A free and open-source firmware for digital ham radios. Supports M17 and offers a completely different UI experience.</p>
-                      <div className="flex gap-3">
-                        <a 
-                          href="https://openrtx.org/" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-primary text-xs py-2"
-                        >
-                          Visit OpenRTX
-                        </a>
-                        <a 
-                          href="https://github.com/OpenRTX/OpenRTX" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-secondary text-xs py-2 flex items-center gap-1"
-                        >
-                          <Github className="w-3 h-3" /> GitHub
-                        </a>
-                      </div>
-                    </div>
-
-                    <div className="p-6 border border-[#333333] rounded-lg bg-[#1a1a1a] hover:border-red-500/50 transition-colors group">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="font-bold text-red-400">Stock Firmware (v03.13.19)</h3>
-                        <div className="text-right">
-                          <span className="text-[10px] bg-red-500/10 text-red-400 px-2 py-1 rounded font-bold uppercase block mb-1">Last Resort</span>
-                          <span className="text-[9px] opacity-40 font-mono">Released: 2019-03-13</span>
-                        </div>
-                      </div>
-                      <p className="text-xs opacity-60 mb-6">Factory original firmware for MD-380. Use this ONLY to revert to stock settings or for emergency recovery.</p>
-                      <div className="flex gap-3">
-                        <button 
-                          onClick={() => handleFlash('Stock Firmware (v03.13.19)', 'https://corsproxy.io/?https://www.miklor.com/DMR/Toolz/nongps_fw_031319.bin')}
-                          disabled={flashing}
-                          className="btn-primary text-xs py-2 border-red-500/50 hover:bg-red-500/20 disabled:opacity-50"
-                        >
-                          {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Recovery Flash'}
-                        </button>
-                        <a 
-                          href="https://www.miklor.com/DMR/Toolz/nongps_fw_031319.bin" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-secondary text-xs py-2 flex items-center gap-1"
-                        >
-                          <Download className="w-3 h-3" /> Binary
-                        </a>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-8 p-6 border border-dashed border-[#333333] rounded-lg flex items-center justify-between bg-[#1a1a1a]/50">
-                    <div className="text-left">
-                      <h4 className="text-sm font-bold flex items-center gap-2">
-                        <Smartphone className="w-4 h-4 text-[#ffb000]" />
-                        Android 16 Compatibility Mode
-                      </h4>
-                      <p className="text-xs opacity-50">Enables 5ms serial buffer delay and Scoped Storage permission flow for Android 16 / S24 Ultra.</p>
-                    </div>
-                    <button 
-                      onClick={() => setAndroid16Mode(!android16Mode)}
-                      className={cn(
-                        "px-4 py-2 rounded text-[10px] font-bold uppercase tracking-widest transition-all",
-                        android16Mode 
-                          ? "bg-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]" 
-                          : "bg-[#333333] text-white/50 hover:bg-[#444444]"
-                      )}
-                    >
-                      {android16Mode ? 'Enabled' : 'Disabled'}
-                    </button>
-                  </div>
-
-                  <div className="mt-8 p-6 border border-dashed border-[#333333] rounded-lg text-center">
-                    <p className="text-sm opacity-50 mb-4">Have a custom binary? Upload it here to apply patches manually.</p>
-                    <input 
-                      type="file" 
-                      ref={customFirmwareInputRef} 
-                      onChange={handleCustomFirmwareSelect} 
-                      accept=".bin" 
-                      className="hidden" 
-                    />
-                    <button 
-                      onClick={() => customFirmwareInputRef.current?.click()}
-                      className="btn-secondary inline-flex items-center gap-2"
-                    >
-                      <Download className="w-4 h-4" /> Upload Custom Firmware (.bin)
-                    </button>
-                  </div>
-                </div>
-
-                <div className="widget-container p-6">
-                  <h3 className="text-sm font-bold uppercase tracking-widest opacity-50 mb-4">Alternative Versions</h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <a 
-                      href="https://md380.org/firmware/orig/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="p-4 border border-[#333333] rounded bg-[#121212] hover:bg-[#1a1a1a] transition-colors flex items-center justify-between"
-                    >
-                      <span className="text-xs">MD380.org Archive</span>
-                      <Download className="w-3 h-3 opacity-30" />
-                    </a>
-                    <div className="p-4 border border-[#333333] rounded bg-[#121212] opacity-50 cursor-not-allowed flex items-center justify-between">
-                      <span className="text-xs">GPS Patched v2.1</span>
-                      <AlertCircle className="w-3 h-3 opacity-30" />
-                    </div>
-                    <div className="p-4 border border-[#333333] rounded bg-[#121212] opacity-50 cursor-not-allowed flex items-center justify-between">
-                      <span className="text-xs">Experimental Core</span>
-                      <AlertCircle className="w-3 h-3 opacity-30" />
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'resources' && (
-              <motion.div
-                key="resources"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-8"
-              >
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="widget-container p-6">
-                    <div className="flex items-center gap-3 mb-6">
-                      <Database className="w-6 h-6 text-[#ffb000]" />
-                      <h3 className="text-lg font-bold">KG5RKI Download Archive</h3>
-                    </div>
-                    <p className="text-sm opacity-70 mb-6 leading-relaxed">
-                      Known as the <span className="text-[#ffb000] font-bold italic">Gold Standard</span> for DMR binaries. 
-                      KG5RKI maintains a comprehensive collection of firmware versions, tools, and drivers for the MD-380/390 series.
-                    </p>
-                    <a 
-                      href="https://kg5rki.com/new2/index.php" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-primary w-full flex items-center justify-center gap-2"
-                    >
-                      Visit KG5RKI Archive
-                    </a>
-                  </div>
-
-                  <div className="widget-container p-6">
-                    <div className="flex items-center gap-3 mb-6">
-                      <Info className="w-6 h-6 text-[#ffb000]" />
-                      <h3 className="text-lg font-bold">Documentation</h3>
-                    </div>
-                    <p className="text-sm opacity-70 mb-6 leading-relaxed">
-                      Comprehensive guide for Tytera MD-380 Toolz. Covers installation, features, and advanced configuration.
-                    </p>
-                    <a 
-                      href="https://www.miklor.com/DMR/pdf/TyMD380Toolz.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> Download PDF Guide
-                    </a>
-                    <a 
-                      href="https://www.qsl.net/dl4yhf/RT3/md380_fw.html" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> DL4YHF Firmware Info
-                    </a>
-                    <a 
-                      href="https://evoham.com/dmr-programming-software-firmware/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Smartphone className="w-4 h-4" /> EvoHam Programming Guide
-                    </a>
-                    <a 
-                      href="https://www.darc.de/fileadmin/filemounts/distrikte/n/ortsverbaende/20/Downloads/DMR-Software/Installation-und-Benutzung-MD380-Toolz.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> DARC MD380-Toolz Guide (DE)
-                    </a>
-                    <a 
-                      href="http://firac.at/oe7bsh/QSP_04-2017_md380fw.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> QSP 04-2017: MD380 Firmware (DE)
-                    </a>
-                    <a 
-                      href="https://www.media2000.org/1203/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> Media2000 MD-380 Resource
-                    </a>
-                    <a 
-                      href="https://www.media2000.org/1197/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> Media2000 Tools & Guides
-                    </a>
-                    <a 
-                      href="https://www.tyt888.com/download.html" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> TYT Official Downloads
-                    </a>
-                    <a 
-                      href="https://dc7jzb.de/tutorials/funkgeraete/tytera-md380/funktionen-der-md380tools/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> DC7JZB Tools Tutorial (DE)
-                    </a>
-                    <a 
-                      href="https://github.com/travisgoodspeed/md380tools/blob/master/README.de.md" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Github className="w-4 h-4" /> md380tools README (DE)
-                    </a>
-                    <a 
-                      href="https://dl-nordwest.com/index.php/2025/03/23/modifikation-eines-tyt-md380-retevis-rt3-fuer-m17-erfahrungsbericht/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> DL-Nordwest M17 Mod (DE)
-                    </a>
-                    <a 
-                      href="https://www.ok1pmp.eu/tyt-md-380-firmware/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> OK1PMP Firmware Guide (CZ)
-                    </a>
-                    <a 
-                      href="https://www.radiofouine.net/downloads/Public/DMR/Tytera/MD-380/Firmwares/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Folder className="w-4 h-4" /> RadioFouine Firmware Archive
-                    </a>
-                    <a 
-                      href="https://www.qsl.net/kb9mwr/projects/dv/dmr/Reverse%20Engineering%20the%20Tytera%20MD380.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> Reverse Engineering Report (KB9MWR)
-                    </a>
-                    <a 
-                      href="https://kg5rki.com/MD380_AIO/TyteraFlashToolv1_05.zip" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> Tytera Flash Tool v1.05
-                    </a>
-                    <a 
-                      href="https://kg5rki.com/MD380_BETA/TyteraFlashTool_v1_08c_BETA.zip" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> Tytera Flash Tool v1.08c BETA
-                    </a>
-                    <a 
-                      href="https://kg5rki.com/MD380_AIO/TyMD380Toolz.apk" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> MD380Toolz Android App
-                    </a>
-                    <a 
-                      href="https://wiki.brandmeister.network/index.php/MD380_Support" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> BrandMeister MD380 Support
-                    </a>
-                    <a 
-                      href="https://www.sbarc.org/Downloads/DMR/Firmware/DMR%20MD380%20Toolz%20Made%20Easy.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <FileText className="w-4 h-4" /> MD380 Toolz Made Easy (SBARC)
-                    </a>
-                    <a 
-                      href="https://www.darc.de/der-club/distrikte/e/ortsverbaende/29/download/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> DARC District E29 Downloads (DE)
-                    </a>
-                    <a 
-                      href="http://firac.at/oe7bsh/QSP_04-2017_md380fw.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <FileText className="w-4 h-4" /> QSP 04-2017 MD380 Firmware (DE)
-                    </a>
-                    <a 
-                      href="https://www.facebook.com/groups/KD4ZToolkit/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Users className="w-4 h-4" /> KD4Z Toolkit Facebook Group
-                    </a>
-                    <a 
-                      href="https://www.buytwowayradios.com/tyt-md-uv380.html" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> BuyTwoWayRadios (Drivers/SW)
-                    </a>
-                    <a 
-                      href="https://kg5rki.com/MD380_AIO/experiment.bin" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> MD380Tools F/W V01.34
-                    </a>
-                    <a 
-                      href="https://cdn-learn.adafruit.com/downloads/pdf/tytera-md-380-dmr.pdf" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <FileText className="w-4 h-4" /> Adafruit MD-380 DMR Guide
-                    </a>
-                    <a 
-                      href="https://sq9jdo.com.pl/MD-380/MD-380_Tools/md380tools_1.html" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> SQ9JDO MD-380 Tools Guide (PL)
-                    </a>
-                    <a 
-                      href="https://web1.foxhollow.ca/DMR/Files/Firmware/MD380-MD390-Windows-Radio-Updater.zip" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> Windows Radio Updater (Zip)
-                    </a>
-                    <a 
-                      href="https://md380.org/releases/daily/" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> MD380 Daily Releases
-                    </a>
-                    <a 
-                      href="https://swissdmr.ch/download/tytera/CPS-TYT-setup_v1_37.zip" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Download className="w-4 h-4" /> CPS v1.37 (SwissDMR)
-                    </a>
-                    <a 
-                      href="https://einstein.amsterdam/?page_id=316" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> Einstein.amsterdam Firmware Info
-                    </a>
-                    <a 
-                      href="https://learn.adafruit.com/tytera-md-380-dmr/updating-md-380-firmware" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2 mb-4"
-                    >
-                      <Info className="w-4 h-4" /> Adafruit Firmware Update Guide
-                    </a>
-                    <a 
-                      href="https://github.com/KD4Z/md380tools-vm" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="btn-secondary w-full flex items-center justify-center gap-2"
-                    >
-                      <Github className="w-4 h-4" /> KD4Z md380tools-vm
-                    </a>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="widget-container p-6">
-                    <div className="flex items-center gap-3 mb-6">
-                      <Settings className="w-6 h-6 text-[#ffb000]" />
-                      <h3 className="text-lg font-bold">Hardware Mods & Tech Info (F4BQN)</h3>
-                    </div>
-                    <div className="space-y-3">
-                      <a 
-                        href="http://f4bqn.free.fr/Mods-MD-380/micro.htm" 
-                        target="_blank" 
-                        rel="noreferrer"
-                        className="flex items-center justify-between p-3 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                      >
-                        <span className="text-xs">Mic/Speaker Connector Pinout</span>
-                        <Info className="w-3 h-3 opacity-30" />
-                      </a>
-                      <a 
-                        href="http://radioaficion.com/cms/md-380-dmr/" 
-                        target="_blank" 
-                        rel="noreferrer"
-                        className="flex items-center justify-between p-3 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                      >
-                        <span className="text-xs">Internal Hardware View</span>
-                        <Info className="w-3 h-3 opacity-30" />
-                      </a>
-                      <a 
-                        href="http://f4bqn.free.fr/Mods-MD-380/MD-380UHF_RF_schematic.pdf" 
-                        target="_blank" 
-                        rel="noreferrer"
-                        className="flex items-center justify-between p-3 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                      >
-                        <span className="text-xs">RF Schematic (PDF)</span>
-                        <Download className="w-3 h-3 opacity-30" />
-                      </a>
-                      <a 
-                        href="http://f4bqn.free.fr/Mods-MD-380/Reverse%20Engineering%20the%20Tytera%20MD380.pdf" 
-                        target="_blank" 
-                        rel="noreferrer"
-                        className="flex items-center justify-between p-3 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                      >
-                        <span className="text-xs">Reverse Engineering Report (PDF)</span>
-                        <Download className="w-3 h-3 opacity-30" />
-                      </a>
-                    </div>
-                  </div>
-
-                  <div className="widget-container p-6">
-                    <div className="flex items-center gap-3 mb-6">
-                      <Cpu className="w-6 h-6 text-[#ffb000]" />
-                      <h3 className="text-lg font-bold">Build Environments</h3>
-                    </div>
-                    <p className="text-sm opacity-70 mb-4 leading-relaxed">
-                      For developers wanting to build their own firmware patches.
-                    </p>
-                    <div className="space-y-3">
-                      <div className="p-4 border border-[#333333] rounded bg-[#1a1a1a]">
-                        <h4 className="text-xs font-bold text-[#ffb000] mb-2">KD4Z md380tools-vm</h4>
-                        <p className="text-[10px] opacity-60 mb-3">
-                          A pre-configured VirtualBox VM that provides a complete Linux build environment for md380tools. 
-                          Includes all necessary compilers and scripts.
-                        </p>
-                        <a 
-                          href="https://github.com/KD4Z/md380tools-vm" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1"
-                        >
-                          <Github className="w-3 h-3" /> View Repository
-                        </a>
-                      </div>
-                      <div className="p-4 border border-[#333333] rounded bg-[#1a1a1a]">
-                        <h4 className="text-xs font-bold text-[#ffb000] mb-2">SwissDMR Resources</h4>
-                        <p className="text-[10px] opacity-60 mb-3">
-                          Experimental firmware D13 (MD380/390) and S13 (GPS) along with official CPS software.
-                        </p>
-                        <a 
-                          href="https://swissdmr.ch/wordpress/?page_id=1759" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1"
-                        >
-                          <Info className="w-3 h-3" /> SwissDMR MD380/390 Page
-                        </a>
-                      </div>
-                      <div className="p-4 border border-[#333333] rounded bg-[#1a1a1a]">
-                        <h4 className="text-xs font-bold text-[#ffb000] mb-2">DL4YHF Firmware Overview</h4>
-                        <p className="text-[10px] opacity-60 mb-3">
-                          Deep technical analysis of the MD380 firmware, including source code overview, diagnostic functions, and disassembly guides.
-                        </p>
-                        <a 
-                          href="https://www.qsl.net/dl4yhf/RT3/md380_fw.html" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1"
-                        >
-                          <Info className="w-3 h-3" /> Technical Deep Dive
-                        </a>
-                      </div>
-                      <div className="p-4 border border-[#333333] rounded bg-[#1a1a1a]">
-                        <h4 className="text-xs font-bold text-[#ffb000] mb-2">Foxhollow Experimental Firmware</h4>
-                        <p className="text-[10px] opacity-60 mb-3">
-                          Latest experimental firmware (2025-01-13) for MD380/390 and RT3/RT8. Includes patched features and daily updates.
-                        </p>
-                        <a 
-                          href="https://web1.foxhollow.ca/DMR/?menu=experimental" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1 mb-2"
-                        >
-                          <Download className="w-3 h-3" /> Latest Experimental Build
-                        </a>
-                        <a 
-                          href="https://web1.foxhollow.ca/DMR/TYT/Firmware/Experimental/" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1"
-                        >
-                          <Info className="w-3 h-3" /> Direct Directory Listing
-                        </a>
-                      </div>
-                      <div className="p-4 border border-[#333333] rounded bg-[#1a1a1a]">
-                        <h4 className="text-xs font-bold text-[#ffb000] mb-2">IK6DIO Backup Repository</h4>
-                        <p className="text-[10px] opacity-60 mb-3">
-                          A comprehensive backup of various firmware versions for MD380/390 and RT3/RT8, including older stable releases and tools.
-                        </p>
-                        <a 
-                          href="https://www.ik6dio.it/download-2/windows/backup-firmware-for-md380390-rt38/" 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] text-[#ffb000] hover:underline flex items-center gap-1"
-                        >
-                          <Download className="w-3 h-3" /> View Backup Archive
-                        </a>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="widget-container p-6 mb-8">
-                  <h3 className="text-sm font-bold uppercase tracking-widest opacity-50 mb-4">Quick Setup Guide (SQ9JDO)</h3>
-                  <div className="space-y-4 text-xs opacity-70 leading-relaxed">
-                    <p>1. **Download Tools**: Get the Windows Radio Updater from the Resources section.</p>
-                    <p>2. **DFU Mode**: Turn radio OFF. Hold **PTT** + **Top Orange Button** and turn ON. LED should flash red/green.</p>
-                    <p>3. **Connect**: Use a standard MD-380 USB programming cable to connect to your PC.</p>
-                    <p>4. **Flash**: Run the updater, select your firmware (e.g., V01.34), and click Update.</p>
-                    <p className="text-[10px] italic mt-2 opacity-50">Note: Ensure drivers are installed from BuyTwoWayRadios for Windows 10 Pro users.</p>
-                  </div>
-                </div>
-
-                <div className="widget-container p-6">
-                  <h3 className="text-sm font-bold uppercase tracking-widest opacity-50 mb-4">External Repositories</h3>
-                  <div className="space-y-4">
-                    <a 
-                      href="https://github.com/DMR-Database/md380tools.git" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="flex items-center justify-between p-4 border border-[#333333] rounded hover:border-[#ffb000] transition-colors mb-4"
-                    >
-                      <div className="flex items-center gap-3">
-                        <Github className="w-4 h-4 opacity-50" />
-                        <div>
-                          <p className="text-sm font-bold">DMR-Database / md380tools</p>
-                          <p className="text-[10px] opacity-50">Main firmware repository and build environment</p>
-                        </div>
-                      </div>
-                      <Download className="w-4 h-4 opacity-30" />
-                    </a>
-                    <a 
-                      href="https://github.com/travisgoodspeed/md380tools.git" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="flex items-center justify-between p-4 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                    >
-                      <div className="flex items-center gap-3">
-                        <Github className="w-4 h-4 opacity-50" />
-                        <div>
-                          <p className="text-sm font-bold">Travis Goodspeed / md380tools</p>
-                          <p className="text-[10px] opacity-50">The pioneering repository for MD-380 firmware reverse engineering and C5000 baseband research.</p>
-                        </div>
-                      </div>
-                      <Download className="w-4 h-4 opacity-30" />
-                    </a>
-                    <a 
-                      href="https://github.com/wh6av/win380-390-tools.git" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="flex items-center justify-between p-4 border border-[#333333] rounded hover:border-[#ffb000] transition-colors"
-                    >
-                      <div className="flex items-center gap-3">
-                        <Github className="w-4 h-4 opacity-50" />
-                        <div>
-                          <p className="text-sm font-bold">wh6av / win380-390-tools</p>
-                          <p className="text-[10px] opacity-50">Windows-based tools for MD-380/390 firmware management and user database updates.</p>
-                        </div>
-                      </div>
-                      <Download className="w-4 h-4 opacity-30" />
-                    </a>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+          </div>
         </div>
+
+        {/* Instructions Overlay */}
+        <AnimatePresence>
+          {showInstructions && (
+            <motion.div 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+              className="absolute inset-y-0 right-0 w-96 bg-[#E4E3E0] border-l border-[#141414] z-50 p-10 shadow-2xl overflow-y-auto"
+            >
+              <div className="flex items-center justify-between mb-10">
+                <h2 className="text-2xl font-serif italic">Instructions</h2>
+                <button onClick={() => setShowInstructions(false)} className="hover:opacity-50">
+                  <ChevronRight className="w-6 h-6" />
+                </button>
+              </div>
+              
+              <div className="space-y-8 text-sm leading-relaxed">
+                <section>
+                  <h3 className="font-mono uppercase tracking-widest text-xs font-bold mb-3">Usage</h3>
+                  <ol className="list-decimal list-inside space-y-3 opacity-70">
+                    <li>Select the desired mods and customize as needed.</li>
+                    <li>Select your radio model or leave as "Patch for all radios".</li>
+                    <li>Click "Patch" and watch the console output.</li>
+                    <li>Click "Save" to download or "Flash Directly" to update your radio.</li>
+                  </ol>
+                </section>
+
+                <section>
+                  <h3 className="font-mono uppercase tracking-widest text-xs font-bold mb-3">Flashing Directly</h3>
+                  <p className="opacity-70 mb-3">
+                    Modern Chromium-based browsers (Chrome, Edge, Opera) allow UVMOD to flash firmware directly.
+                  </p>
+                  <ol className="list-decimal list-inside space-y-3 opacity-70">
+                    <li>Connect programming cable (CH340/CP210x).</li>
+                    <li>Hold PTT and turn on radio to enter bootloader mode (flashlight turns on).</li>
+                    <li>Connect cable to radio.</li>
+                    <li>Click "Flash directly" and wait.</li>
+                  </ol>
+                </section>
+
+                <div className="pt-10 border-t border-[#141414]/20">
+                  <p className="text-[10px] font-mono opacity-50">
+                    UVMOD RX-TX is based on whoismatt's uvmod. Developed by RECON.
+                  </p>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Flashing Progress Overlay */}
+        <AnimatePresence>
+          {isFlashing && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[60] bg-[#E4E3E0]/90 backdrop-blur-sm flex flex-col items-center justify-center p-10 text-center"
+            >
+              <div className="w-full max-w-md space-y-8">
+                <div className="relative w-32 h-32 mx-auto">
+                  <RefreshCw className="w-full h-full animate-spin-slow" strokeWidth={1} />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-4xl font-serif italic">Flashing Radio...</h2>
+                  <p className="text-xs font-mono uppercase tracking-widest opacity-50">Do not disconnect cable</p>
+                </div>
+                <div className="w-full border border-[#141414] h-4 p-0.5">
+                  <motion.div 
+                    className="bg-[#141414] h-full"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${flashProgress}%` }}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px] font-mono uppercase tracking-widest font-bold">
+                  <span>Progress: {flashProgress}%</span>
+                  <span>Writing Blocks...</span>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
     </div>
   );

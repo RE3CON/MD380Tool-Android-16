@@ -18,18 +18,22 @@ export const fetchDMRUsers = async (): Promise<DMRUser[]> => {
 let activeDevice: any = null;
 
 const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
-  const transferIn = async (params: any, length: number, retries = 15) => {
-    const baseDelay = isAndroid16 ? 600 : 200;
+  const transferIn = async (params: any, length: number, retries = 30) => {
+    const baseDelay = isAndroid16 ? 800 : 300;
     for (let i = 0; i < retries; i++) {
       try {
         if (!activeDevice || !device.opened) throw new Error('Device disconnected');
         return await device.controlTransferIn(params, length);
       } catch (e: any) {
-        if (i === retries - 1) throw e;
+        if (i === retries - 1) {
+          console.error(`transferIn failed after ${retries} retries:`, e);
+          throw e;
+        }
         
         // If we get a transfer error, the device might be stalled or busy
-        if (e.name === 'NetworkError' || e.message?.includes('transfer error')) {
+        if (e.name === 'NetworkError' || e.message?.includes('transfer error') || e.name === 'NotFoundError') {
            try {
+             // DFU_CLRSTATUS to clear any stall/error on the device side
              await device.controlTransferOut({
                requestType: 'class',
                recipient: 'interface',
@@ -37,24 +41,31 @@ const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
                value: 0,
                index: 0
              });
+             // Wait a bit longer after a clear status
+             await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
            } catch (ignore) {}
         }
         
-        await new Promise(r => setTimeout(r, baseDelay + (i * 100)));
+        // Exponential-ish backoff
+        const delay = baseDelay + (i * (isAndroid16 ? 150 : 50));
+        await new Promise(r => setTimeout(r, delay));
       }
     }
   };
 
-  const transferOut = async (params: any, data?: Uint8Array, retries = 15) => {
-    const baseDelay = isAndroid16 ? 600 : 200;
+  const transferOut = async (params: any, data?: Uint8Array, retries = 30) => {
+    const baseDelay = isAndroid16 ? 800 : 300;
     for (let i = 0; i < retries; i++) {
       try {
         if (!activeDevice || !device.opened) throw new Error('Device disconnected');
         return await device.controlTransferOut(params, data);
       } catch (e: any) {
-        if (i === retries - 1) throw e;
+        if (i === retries - 1) {
+          console.error(`transferOut failed after ${retries} retries:`, e);
+          throw e;
+        }
         
-        if (e.name === 'NetworkError' || e.message?.includes('transfer error')) {
+        if (e.name === 'NetworkError' || e.message?.includes('transfer error') || e.name === 'NotFoundError') {
            try {
              await device.controlTransferOut({
                requestType: 'class',
@@ -63,10 +74,12 @@ const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
                value: 0,
                index: 0
              });
+             await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
            } catch (ignore) {}
         }
         
-        await new Promise(r => setTimeout(r, baseDelay + (i * 100)));
+        const delay = baseDelay + (i * (isAndroid16 ? 150 : 50));
+        await new Promise(r => setTimeout(r, delay));
       }
     }
   };
@@ -80,6 +93,33 @@ const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
       index: 0
     }, 6);
     return res.data;
+  };
+
+  const waitStatus = async (expectedState: number, maxRetries = 20) => {
+    let status = await getStatus();
+    let state = status?.getUint8(4);
+    let count = 0;
+    
+    while (state === 4 && count < maxRetries) { // 4 is dfuDNBUSY
+      const timeout = status!.getUint8(1) | (status!.getUint8(2) << 8) | (status!.getUint8(3) << 16);
+      await new Promise(r => setTimeout(r, Math.max(timeout, isAndroid16 ? 100 : 40)));
+      status = await getStatus();
+      state = status?.getUint8(4);
+      count++;
+    }
+    
+    if (state !== expectedState && state !== 4) {
+      console.warn(`DFU State mismatch: expected ${expectedState}, got ${state}. Clearing status...`);
+      await transferOut({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 4, // DFU_CLRSTATUS
+        value: 0,
+        index: 0
+      });
+    }
+    
+    return status;
   };
 
   const getState = async () => {
@@ -133,17 +173,16 @@ const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
     }, data);
     
     // Always add a small delay to let the STM32 process the command
-    await new Promise(r => setTimeout(r, isAndroid16 ? 50 : 20));
+    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 40));
     
     // The original app calls getStatus() twice immediately after download
+    // We use waitStatus to handle the busy state correctly
     try {
-      await getStatus();
-      await getStatus();
+      await waitStatus(5); // 5 is dfuDNLOAD-IDLE
     } catch (e) {
-      console.warn('getStatus failed after download, retrying...', e);
-      await new Promise(r => setTimeout(r, 100));
-      await getStatus();
-      await getStatus();
+      console.warn('waitStatus failed after download, retrying...', e);
+      await new Promise(r => setTimeout(r, 200));
+      await waitStatus(5);
     }
   };
 
@@ -183,16 +222,16 @@ const createDfuHelpers = (device: any, isAndroid16: boolean = false) => {
     }, length);
     
     try {
-      await new Promise(r => setTimeout(r, 10));
-      await getStatus();
+      await new Promise(r => setTimeout(r, isAndroid16 ? 50 : 20));
+      await waitStatus(2); // 2 is dfuIDLE
     } catch (e) {
-      console.warn('getStatus failed after upload, continuing...', e);
+      console.warn('waitStatus failed after upload, continuing...', e);
     }
     
     return result;
   };
 
-  return { getStatus, getState, abort, enterDfuMode, download, md380cmd, setAddress, eraseBlock, upload, transferOut, transferIn };
+  return { getStatus, getState, abort, enterDfuMode, download, md380cmd, setAddress, eraseBlock, upload, transferOut, transferIn, waitStatus };
 };
 
 export const requestDevice = async (): Promise<boolean> => {
@@ -387,29 +426,20 @@ export const flashDatabase = async (
     const TOTAL_SIZE = dataBuffer.length;
     const TOTAL_BLOCKS = Math.ceil(TOTAL_SIZE / CHUNK_SIZE);
     
-    const transferOutWithRetry = async (params: any, data?: Uint8Array, retries = 10) => {
-      for (let i = 0; i < retries; i++) {
-        try {
-          if (!activeDevice) throw new Error('Device disconnected');
-          return await device.controlTransferOut(params, data);
-        } catch (e) {
-          if (i === retries - 1) throw e;
-          await new Promise(r => setTimeout(r, 200));
-        }
-      }
-    };
+    // Use helpers for more robust transfers
+    const { transferOut, transferIn } = createDfuHelpers(device, isAndroid16);
 
     console.log(`Starting User Database (SPI Flash) transfer... Size: ${TOTAL_SIZE} bytes`);
 
     // 1. Initialize SPI Flash Write Mode
-    await transferOutWithRetry({
+    await transferOut({
       requestType: 'vendor',
       recipient: 'device',
       request: 0x90, // Custom command to prepare SPI flash
       value: 0,
       index: 0
     });
-    await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 50));
+    await new Promise(r => setTimeout(r, isAndroid16 ? 300 : 100));
 
     for (let block = 0; block < TOTAL_BLOCKS; block++) {
       const offset = block * CHUNK_SIZE;
@@ -425,7 +455,7 @@ export const flashDatabase = async (
       const wIndex = (address >> 16) & 0xFFFF; // High 16 bits
       
       // 2. Write SPI Flash Block (bRequest = 0x91)
-      await transferOutWithRetry({
+      await transferOut({
         requestType: 'vendor',
         recipient: 'device',
         request: 0x91, // Write SPI Flash command
@@ -435,16 +465,16 @@ export const flashDatabase = async (
 
       // 3. Android 16 / S24U Timing Patch (Slower Pacing)
       if (isAndroid16) {
-        await new Promise(r => setTimeout(r, 100)); 
+        await new Promise(r => setTimeout(r, 150)); 
       } else {
-        await new Promise(r => setTimeout(r, 40)); 
+        await new Promise(r => setTimeout(r, 60)); 
       }
 
       // 4. Verify/Sync Block (bRequest = 0x92 - Read SPI Flash Status)
       let statusOk = false;
-      for (let retries = 0; retries < 3; retries++) {
+      for (let retries = 0; retries < 10; retries++) {
         try {
-          await device.controlTransferIn({
+          await transferIn({
             requestType: 'vendor',
             recipient: 'device',
             request: 0x92, // Read SPI Flash Status
@@ -455,7 +485,7 @@ export const flashDatabase = async (
           break;
         } catch (e) {
           // If the device stalls, it means it's still busy. Wait and retry.
-          await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 20));
+          await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 50));
         }
       }
       
@@ -469,7 +499,7 @@ export const flashDatabase = async (
     console.log('Database flash complete. Rebooting radio...');
     
     // 5. Finalize and Reboot
-    await device.controlTransferOut({
+    await transferOut({
       requestType: 'vendor',
       recipient: 'device',
       request: 0x94, // Custom command to finalize SPI flash and reboot
@@ -524,35 +554,21 @@ export const readFirmware = async (
       value: 0,
       index: 0
     });
-    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
+    await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
 
     console.log('Setting Address Pointer to 0x0800C000 for reading...');
     const setAddrCmd = new Uint8Array([0x21, 0x00, 0xC0, 0x00, 0x08]);
     await download(0, setAddrCmd);
 
-    let statusRetries = 5;
-    while (statusRetries > 0) {
-      try {
-        await getStatus();
-        break;
-      } catch (e) {
-        statusRetries--;
-        if (statusRetries === 0) throw e;
-        console.warn('getStatus failed, retrying...', e);
-        await new Promise(r => setTimeout(r, 500));
-      }
-    }
+    // Ensure we are in the correct state after download
+    const { waitStatus, abort } = createDfuHelpers(device, isAndroid16);
+    await waitStatus(5); // dfuDNLOAD-IDLE
+    
+    // Abort to return to IDLE for upload
+    await abort();
+    await waitStatus(2); // dfuIDLE
     
     await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
-
-    await transferOut({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 4, // DFU_CLRSTATUS
-      value: 0,
-      index: 0
-    });
-    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
 
     console.log('Starting firmware read...');
     for (let block = 0; block < TOTAL_BLOCKS; block++) {
