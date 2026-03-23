@@ -61,161 +61,163 @@ export const flashFirmware = async (
 
   try {
     const device = activeDevice;
-    const CHUNK_SIZE = 1024; // Standard DFU block size
-    const TOTAL_SIZE = firmwareBuffer.length;
-    const TOTAL_BLOCKS = Math.ceil(TOTAL_SIZE / CHUNK_SIZE);
+
+    // --- Helper Functions based on TyMD380Tool ---
     
-    // 1. DFU Initialization / Clear Status
-    console.log('Clearing DFU Status...');
-    await device.controlTransferOut({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 4, // DFU_CLRSTATUS
-      value: 0,
-      index: 0
-    });
-    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
+    const getStatus = async () => {
+      const res = await device.controlTransferIn({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 3, // DFU_GETSTATUS
+        value: 0,
+        index: 0
+      }, 6);
+      return res.data;
+    };
 
-    // 2. Set Address Pointer to 0x0800C000 (Standard MD-380 Firmware Base)
-    // This is REQUIRED for the initial flash process to start correctly!
-    console.log('Setting Address Pointer to 0x0800C000...');
-    const setAddrCmd = new Uint8Array([0x21, 0x00, 0xC0, 0x00, 0x08]);
-    await device.controlTransferOut({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 1, // DFU_DNLOAD
-      value: 0,
-      index: 0
-    }, setAddrCmd);
+    const getState = async () => {
+      const res = await device.controlTransferIn({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 5, // DFU_GETSTATE
+        value: 0,
+        index: 0
+      }, 1);
+      return res.data?.getUint8(0);
+    };
 
-    // 3. Execute Set Address and wait for dfuDNLOAD-IDLE
-    await device.controlTransferIn({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 3, // DFU_GETSTATUS
-      value: 0,
-      index: 0
-    }, 6);
-    
-    // Give the flash controller plenty of time to initialize the base address
-    await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
+    const abort = async () => {
+      await device.controlTransferOut({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 6, // DFU_ABORT
+        value: 0,
+        index: 0
+      });
+    };
 
-    // 4. Clear status again to ensure we are in a clean state before writing
-    await device.controlTransferOut({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 4, // DFU_CLRSTATUS
-      value: 0,
-      index: 0
-    });
-    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
+    const enterDfuMode = async () => {
+      let state = await getState();
+      let retries = 5;
+      while (state !== 2 && retries > 0) { // 2 is dfuIDLE
+        await abort();
+        await new Promise(r => setTimeout(r, 50));
+        
+        await device.controlTransferOut({
+          requestType: 'class',
+          recipient: 'interface',
+          request: 4, // DFU_CLRSTATUS
+          value: 0,
+          index: 0
+        });
+        
+        state = await getState();
+        retries--;
+      }
+    };
 
-    console.log('Starting firmware transfer...');
-    for (let block = 0; block < TOTAL_BLOCKS; block++) {
-      const offset = block * CHUNK_SIZE;
-      const chunk = firmwareBuffer.slice(offset, offset + CHUNK_SIZE);
-      
-      // Pad the last block if necessary
-      const data = new Uint8Array(CHUNK_SIZE).fill(0xFF);
-      data.set(chunk);
-      
-      // 5. DFU_DNLOAD (Download block)
+    const download = async (block: number, data: Uint8Array) => {
       await device.controlTransferOut({
         requestType: 'class',
         recipient: 'interface',
         request: 1, // DFU_DNLOAD
-        value: block + 2, // Block index (usually starts at 2 for MD-380)
+        value: block,
         index: 0
       }, data);
+      
+      if (isAndroid16) await new Promise(r => setTimeout(r, 10));
+      
+      // The original app calls getStatus() twice immediately after download
+      await getStatus();
+      await getStatus();
+    };
 
-      // 6. Android 16 / S24U Timing Patch (Slower Pacing)
-      // "Not too fast" - High-speed controllers on Snapdragon 8 Gen 3 need 
-      // significant time to clear the USB buffer before the next GETSTATUS request.
-      if (isAndroid16) {
-        await new Promise(r => setTimeout(r, 40)); // 40ms delay for buffer stability
-      } else {
-        await new Promise(r => setTimeout(r, 10)); // Standard 10ms delay
-      }
+    const md380cmd = async (a: number, b: number) => {
+      await download(0, new Uint8Array([a, b]));
+    };
 
-      // 7. DFU_GETSTATUS (Wait for device to process block)
-      let status = await device.controlTransferIn({
-        requestType: 'class',
-        recipient: 'interface',
-        request: 3, // DFU_GETSTATUS
-        value: 0,
-        index: 0
-      }, 6);
+    const setAddress = async (address: number) => {
+      const buf = new Uint8Array([
+        0x21,
+        address & 0xff,
+        (address >> 8) & 0xff,
+        (address >> 16) & 0xff,
+        (address >> 24) & 0xff
+      ]);
+      await download(0, buf);
+    };
 
-      // Check if device is busy (state 4 = dfuDNBUSY)
-      let state = status.data?.getUint8(4);
-      while (state === 4) {
-        // Parse bwPollTimeout (3 bytes, little endian)
-        const bwPollTimeout = (status.data?.getUint8(1) || 0) |
-                              ((status.data?.getUint8(2) || 0) << 8) |
-                              ((status.data?.getUint8(3) || 0) << 16);
-        
-        // Ensure we wait AT LEAST the requested timeout, plus extra for Android 16
-        const pollDelay = Math.max(bwPollTimeout, isAndroid16 ? 50 : 10);
-        await new Promise(r => setTimeout(r, pollDelay));
-        
-        status = await device.controlTransferIn({
-          requestType: 'class',
-          recipient: 'interface',
-          request: 3,
-          value: 0,
-          index: 0
-        }, 6);
-        state = status.data?.getUint8(4);
-      }
+    const eraseBlock = async (address: number) => {
+      const buf = new Uint8Array([
+        0x41,
+        address & 0xff,
+        (address >> 8) & 0xff,
+        (address >> 16) & 0xff,
+        (address >> 24) & 0xff
+      ]);
+      await download(0, buf);
+    };
 
-      onProgress(((block + 1) / TOTAL_BLOCKS) * 100);
+    // --- Main Flashing Logic ---
+
+    console.log('Entering DFU Mode...');
+    await enterDfuMode();
+
+    console.log('Sending init commands...');
+    await md380cmd(0x91, 0x01); // -0x6f, 1
+    await md380cmd(0xa2, 0x02); // -0x5e, 2
+    await md380cmd(0xa2, 0x02); // -0x5e, 2
+    await md380cmd(0xa2, 0x03); // -0x5e, 3
+    await md380cmd(0xa2, 0x04); // -0x5e, 4
+    await md380cmd(0xa2, 0x07); // -0x5e, 7
+
+    console.log('Erasing flash memory...');
+    await eraseBlock(0x0800C000);
+    
+    let eraseStep = 0;
+    const totalEraseSteps = ((0x080F0000 - 0x08010000) / 0x10000) + 1;
+    
+    for (let i = 0x08010000; i < 0x080F0000; i += 0x10000) {
+      await eraseBlock(i);
+      eraseStep++;
+      // Erasing represents the first 15% of progress
+      onProgress((eraseStep / totalEraseSteps) * 15);
     }
 
-    // 8. DFU Manifestation / Exit DFU
-    console.log('Sending 0-byte DFU_DNLOAD to trigger manifestation...');
-    await device.controlTransferOut({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 1, // DFU_DNLOAD
-      value: 0, // Zero length download to trigger manifestation
-      index: 0
-    });
+    console.log('Writing firmware...');
+    let upgradeAddress = 0x0800C000;
+    // CRITICAL: Skip the first 256 bytes (0x100) of the .bin file as per the original app
+    let offset = 0x100; 
+    const totalBytesToWrite = firmwareBuffer.length - offset;
+    let bytesWritten = 0;
+    
+    while (offset < firmwareBuffer.length) {
+      const toget = Math.min(1024, firmwareBuffer.length - offset);
+      const block = new Uint8Array(1024).fill(0xFF);
+      block.set(firmwareBuffer.slice(offset, offset + toget));
+      
+      await setAddress(upgradeAddress);
+      await download(2, block); // Always block 2 for data
+      
+      upgradeAddress += toget;
+      offset += toget;
+      bytesWritten += toget;
+      
+      // Writing represents 15% to 100% of progress
+      const writeProgress = 15 + ((bytesWritten / totalBytesToWrite) * 85);
+      onProgress(writeProgress);
+    }
 
-    // 6. Read status to advance state machine to dfuMANIFEST-SYNC
-    await device.controlTransferIn({
-      requestType: 'class',
-      recipient: 'interface',
-      request: 3, // DFU_GETSTATUS
-      value: 0,
-      index: 0
-    }, 6);
-
-    // 7. Read status again to advance to dfuMANIFEST / trigger reboot
+    console.log('Rebooting device...');
     try {
-      await device.controlTransferIn({
-        requestType: 'class',
-        recipient: 'interface',
-        request: 3, // DFU_GETSTATUS
-        value: 0,
-        index: 0
-      }, 6);
+      await md380cmd(0x91, 0x05); // -0x6f, 5
     } catch (e) {
-      // Device might disconnect here as it reboots
-      console.log('Device disconnected during manifestation (expected).');
+      console.log('Device disconnected during reboot (expected).');
     }
 
-    // 8. Force USB Reset to ensure the radio boots into the new firmware
-    console.log('Issuing USB reset to restart the radio...');
-    try {
-      await device.reset();
-    } catch (e) {
-      console.log('USB reset threw an error (often expected if device already rebooted):', e);
-    }
-
-    // Clear active device since it has rebooted
     activeDevice = null;
-
     return true;
+
   } catch (error) {
     console.error('DFU Flashing Error:', error);
     return false;
