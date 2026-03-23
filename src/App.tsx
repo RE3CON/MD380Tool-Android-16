@@ -32,7 +32,7 @@ import {
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { DMRUser, DeviceStatus, AndroidPatchInfo } from './types';
-import { fetchDMRUsers, requestDevice, flashFirmware, flashDatabase } from './services/dmrService';
+import { fetchDMRUsers, requestDevice, flashFirmware, flashDatabase, readFirmware } from './services/dmrService';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -43,6 +43,7 @@ export default function App() {
   const [users, setUsers] = useState<DMRUser[]>([]);
   const [loading, setLoading] = useState(false);
   const [flashing, setFlashing] = useState(false);
+  const [reading, setReading] = useState(false);
   const [flashProgress, setFlashProgress] = useState(0);
   const [android16Mode, setAndroid16Mode] = useState(false);
   const [device, setDevice] = useState<DeviceStatus>({
@@ -108,22 +109,43 @@ Thread.sleep(5);`,
     setLoading(false);
   };
 
-  const handleFlash = async (firmwareName: string) => {
+  const handleFlash = async (firmwareName: string, url?: string) => {
     if (!device.connected) {
       alert('Please connect your radio first.');
       setActiveTab('device');
       return;
     }
 
+    if (!url) {
+      alert(`Direct flashing for ${firmwareName} is not supported. Please download the binary manually and use the "Upload Custom Firmware" button.`);
+      return;
+    }
+
     setFlashing(true);
     setFlashProgress(0);
     
+    let firmwareBuffer: Uint8Array;
+    try {
+      console.log(`Fetching firmware from ${url}...`);
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      firmwareBuffer = new Uint8Array(arrayBuffer);
+    } catch (error) {
+      console.error('Failed to fetch firmware:', error);
+      alert(`Could not download ${firmwareName} automatically due to browser security (CORS) or network issues.\n\nPlease download the file manually using the link provided, then use the "Upload Custom Firmware" button at the bottom of the page.`);
+      setFlashing(false);
+      return;
+    }
+
     // Apply Android 16 timing patch if enabled
     if (android16Mode) {
       console.log('Android 16 Compatibility Mode: Applying 5ms serial buffer delay...');
     }
 
-    const success = await flashFirmware((progress) => {
+    const success = await flashFirmware(firmwareBuffer, (progress) => {
       setFlashProgress(progress);
     }, android16Mode);
 
@@ -142,9 +164,94 @@ Thread.sleep(5);`,
     setFlashing(false);
   };
 
+  const handleReadFirmware = async () => {
+    if (!device.connected) {
+      alert('Please connect your radio first.');
+      setActiveTab('device');
+      return;
+    }
+
+    setReading(true);
+    setFlashProgress(0);
+
+    const firmwareData = await readFirmware((progress) => {
+      setFlashProgress(progress);
+    }, android16Mode);
+
+    if (firmwareData) {
+      // Create a blob and download it
+      const blob = new Blob([firmwareData], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `MD380_Firmware_Backup_${new Date().toISOString().split('T')[0]}.bin`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      setDevice({
+        ...device,
+        connected: false, // Device reboots after DFU
+        lastSync: new Date().toLocaleString()
+      });
+      alert('Successfully read firmware! The backup has been downloaded and the radio is restarting.');
+    } else {
+      alert('Failed to read firmware. Please check your connection.');
+    }
+
+    setReading(false);
+  };
+
   const [dbFile, setDbFile] = useState<File | null>(null);
   const [dbFileData, setDbFileData] = useState<Uint8Array | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const customFirmwareInputRef = useRef<HTMLInputElement>(null);
+
+  const handleCustomFirmwareSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
+
+    if (!device.connected) {
+      alert('Please connect your radio first.');
+      setActiveTab('device');
+      return;
+    }
+
+    const buffer = await selectedFile.arrayBuffer();
+    const firmwareBuffer = new Uint8Array(buffer);
+
+    setFlashing(true);
+    setFlashProgress(0);
+    
+    // Apply Android 16 timing patch if enabled
+    if (android16Mode) {
+      console.log('Android 16 Compatibility Mode: Applying 5ms serial buffer delay...');
+    }
+
+    const success = await flashFirmware(firmwareBuffer, (progress) => {
+      setFlashProgress(progress);
+    }, android16Mode);
+
+    if (success) {
+      setDevice({
+        ...device,
+        connected: false,
+        firmware: selectedFile.name,
+        lastSync: new Date().toLocaleString()
+      });
+      alert(`Successfully flashed ${selectedFile.name}! The radio is now restarting.`);
+    } else {
+      alert('Flashing failed. Please check your connection.');
+    }
+    
+    setFlashing(false);
+    
+    // Reset the input so the same file can be selected again if needed
+    if (customFirmwareInputRef.current) {
+      customFirmwareInputRef.current.value = '';
+    }
+  };
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -163,7 +270,7 @@ Thread.sleep(5);`,
     }
 
     if (!dbFileData) {
-      alert('Please select a CSV database file first.');
+      alert('Please select a users.bin database file first.');
       return;
     }
 
@@ -303,7 +410,7 @@ Thread.sleep(5);`,
         {/* Content Area */}
         <div className="flex-1 overflow-y-auto p-8 relative">
           <AnimatePresence>
-            {flashing && (
+            {(flashing || reading) && (
               <motion.div 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -316,7 +423,7 @@ Thread.sleep(5);`,
                     <div className="absolute inset-0 border-4 border-[#ffb000]/20 rounded-full animate-ping" />
                   </div>
                   <div className="space-y-2">
-                    <h2 className="text-2xl font-bold tracking-tight">Flashing Firmware...</h2>
+                    <h2 className="text-2xl font-bold tracking-tight">{reading ? 'Reading Firmware...' : 'Flashing Firmware...'}</h2>
                     <p className="text-sm opacity-60 italic">Do not disconnect your radio or close this tab.</p>
                   </div>
                   <div className="w-full bg-[#333333] h-2 rounded-full overflow-hidden">
@@ -328,7 +435,7 @@ Thread.sleep(5);`,
                   </div>
                   <div className="flex justify-between text-[10px] font-mono uppercase tracking-widest text-[#ffb000]">
                     <span>{Math.round(flashProgress)}% Complete</span>
-                    <span>Writing Blocks...</span>
+                    <span>{reading ? 'Reading Blocks...' : 'Writing Blocks...'}</span>
                   </div>
                 </div>
               </motion.div>
@@ -479,11 +586,11 @@ Thread.sleep(5);`,
                   <div className="widget-container p-6 border-t-2 border-t-[#ffb000]">
                     <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
                       <Users className="w-5 h-5 text-[#ffb000]" />
-                      Caller ID (CSV Database)
+                      Caller ID (users.bin Database)
                     </h3>
                     <p className="text-sm opacity-70 mb-4 leading-relaxed">
                       Displays the name, callsign, and location of the person talking by 
-                      matching their DMR ID against a local CSV database stored in the radio.
+                      matching their DMR ID against a local users.bin database stored in the radio.
                     </p>
                     <div className="text-[10px] font-mono opacity-50 uppercase tracking-wider">
                       Capacity: ~100,000+ Users
@@ -593,7 +700,7 @@ Thread.sleep(5);`,
                       type="file" 
                       ref={fileInputRef}
                       onChange={handleFileSelect}
-                      accept=".csv,.bin"
+                      accept=".bin"
                       className="hidden"
                     />
                     <button 
@@ -601,11 +708,11 @@ Thread.sleep(5);`,
                       className="btn-secondary flex items-center gap-2"
                     >
                       <FileText className="w-4 h-4" />
-                      {dbFile ? dbFile.name : 'Select CSV File'}
+                      {dbFile ? dbFile.name : 'Select users.bin File'}
                     </button>
-                    <button className="btn-secondary flex items-center gap-2">
+                    <button className="btn-secondary flex items-center gap-2 opacity-50 cursor-not-allowed" disabled>
                       <Download className="w-4 h-4" />
-                      Download Latest CSV
+                      Download Latest DB
                     </button>
                     <button 
                       onClick={handleFlashDatabase}
@@ -708,6 +815,25 @@ Thread.sleep(5);`,
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-6">
+                    <div className="p-6 border border-emerald-500/50 rounded-lg bg-[#1a1a1a] hover:border-emerald-500 transition-colors group relative overflow-hidden">
+                      <div className="absolute top-0 right-0 bg-emerald-500 text-black text-[10px] font-bold px-3 py-1 rounded-bl-lg uppercase tracking-tighter">
+                        Recommended
+                      </div>
+                      <div className="flex justify-between items-start mb-4">
+                        <h3 className="font-bold text-emerald-400 text-lg">Backup Current Firmware</h3>
+                      </div>
+                      <p className="text-sm opacity-70 mb-6">Read the current firmware from your radio and save it as a .bin file. Always do this before flashing a new version.</p>
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={handleReadFirmware}
+                          disabled={reading || flashing}
+                          className="btn-primary bg-emerald-500 hover:bg-emerald-600 text-black text-xs py-2 px-6 disabled:opacity-50"
+                        >
+                          {reading ? `Reading ${Math.round(flashProgress)}%` : 'Read Firmware'}
+                        </button>
+                      </div>
+                    </div>
+
                     <div className="p-6 border border-[#ffb000] rounded-lg bg-[#1a1a1a] hover:bg-[#222222] transition-colors group relative overflow-hidden">
                       <div className="absolute top-0 right-0 bg-[#ffb000] text-black text-[10px] font-bold px-3 py-1 rounded-bl-lg uppercase tracking-tighter">
                         Latest Working Build
@@ -747,7 +873,7 @@ Thread.sleep(5);`,
                       <p className="text-xs opacity-60 mb-6">The definitive community firmware with promiscuous mode, mic gain, and enhanced UI. Highly stable for daily use.</p>
                       <div className="flex gap-3">
                         <button 
-                          onClick={() => handleFlash('KD4Z md380tools (Non-GPS)')}
+                          onClick={() => handleFlash('KD4Z md380tools (Non-GPS)', 'https://raw.githubusercontent.com/DMR-Database/md380tools/master/firmware-noGPS.bin')}
                           disabled={flashing}
                           className="btn-primary text-xs py-2 disabled:opacity-50"
                         >
@@ -804,7 +930,7 @@ Thread.sleep(5);`,
                       <p className="text-xs opacity-60 mb-6">Factory original firmware for MD-380. Use this ONLY to revert to stock settings or for emergency recovery.</p>
                       <div className="flex gap-3">
                         <button 
-                          onClick={() => handleFlash('Stock Firmware (v03.13.19)')}
+                          onClick={() => handleFlash('Stock Firmware (v03.13.19)', 'https://corsproxy.io/?https://www.miklor.com/DMR/Toolz/nongps_fw_031319.bin')}
                           disabled={flashing}
                           className="btn-primary text-xs py-2 border-red-500/50 hover:bg-red-500/20 disabled:opacity-50"
                         >
@@ -845,7 +971,17 @@ Thread.sleep(5);`,
 
                   <div className="mt-8 p-6 border border-dashed border-[#333333] rounded-lg text-center">
                     <p className="text-sm opacity-50 mb-4">Have a custom binary? Upload it here to apply patches manually.</p>
-                    <button className="btn-secondary inline-flex items-center gap-2">
+                    <input 
+                      type="file" 
+                      ref={customFirmwareInputRef} 
+                      onChange={handleCustomFirmwareSelect} 
+                      accept=".bin" 
+                      className="hidden" 
+                    />
+                    <button 
+                      onClick={() => customFirmwareInputRef.current?.click()}
+                      className="btn-secondary inline-flex items-center gap-2"
+                    >
                       <Download className="w-4 h-4" /> Upload Custom Firmware (.bin)
                     </button>
                   </div>

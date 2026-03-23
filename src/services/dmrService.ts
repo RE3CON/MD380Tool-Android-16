@@ -50,6 +50,7 @@ export const requestDevice = async (): Promise<boolean> => {
  * Optimized for Android 16 / S24 Ultra USB Controllers
  */
 export const flashFirmware = async (
+  firmwareBuffer: Uint8Array,
   onProgress: (progress: number) => void,
   isAndroid16: boolean = false
 ): Promise<boolean> => {
@@ -61,7 +62,7 @@ export const flashFirmware = async (
   try {
     const device = activeDevice;
     const CHUNK_SIZE = 1024; // Standard DFU block size
-    const TOTAL_SIZE = 512 * 1024; // Mock 512KB firmware
+    const TOTAL_SIZE = firmwareBuffer.length;
     const TOTAL_BLOCKS = Math.ceil(TOTAL_SIZE / CHUNK_SIZE);
     
     // 1. DFU Initialization / Clear Status
@@ -111,8 +112,12 @@ export const flashFirmware = async (
 
     console.log('Starting firmware transfer...');
     for (let block = 0; block < TOTAL_BLOCKS; block++) {
-      // Mock firmware data for this block
-      const data = new Uint8Array(CHUNK_SIZE).fill(0xAA);
+      const offset = block * CHUNK_SIZE;
+      const chunk = firmwareBuffer.slice(offset, offset + CHUNK_SIZE);
+      
+      // Pad the last block if necessary
+      const data = new Uint8Array(CHUNK_SIZE).fill(0xFF);
+      data.set(chunk);
       
       // 5. DFU_DNLOAD (Download block)
       await device.controlTransferOut({
@@ -254,14 +259,14 @@ export const flashDatabase = async (
       const offset = block * CHUNK_SIZE;
       const chunk = dataBuffer.slice(offset, offset + CHUNK_SIZE);
       
-      // Pad the last block if necessary
-      const paddedChunk = new Uint8Array(CHUNK_SIZE);
+      // Pad the last block if necessary (Flash memory erases to 0xFF)
+      const paddedChunk = new Uint8Array(CHUNK_SIZE).fill(0xFF);
       paddedChunk.set(chunk);
       
       // Calculate SPI Flash Address (Block * 1024)
       const address = offset;
-      const wValue = (address >> 16) & 0xFFFF; // High 16 bits
-      const wIndex = address & 0xFFFF;         // Low 16 bits
+      const wValue = address & 0xFFFF;         // Low 16 bits
+      const wIndex = (address >> 16) & 0xFFFF; // High 16 bits
       
       // 2. Write SPI Flash Block (bRequest = 0x91)
       await device.controlTransferOut({
@@ -318,5 +323,104 @@ export const flashDatabase = async (
   } catch (error) {
     console.error('Database Flashing Error:', error);
     return false;
+  }
+};
+
+/**
+ * Read Firmware from Radio
+ * Uses DFU_UPLOAD to read the firmware from the device.
+ */
+export const readFirmware = async (
+  onProgress: (progress: number) => void,
+  isAndroid16: boolean = false
+): Promise<Uint8Array | null> => {
+  if (!activeDevice) {
+    console.error('No device connected for reading firmware.');
+    return null;
+  }
+
+  try {
+    const device = activeDevice;
+    const CHUNK_SIZE = 1024;
+    const TOTAL_SIZE = 1024 * 1024; // 1MB standard firmware size for MD380
+    const TOTAL_BLOCKS = Math.ceil(TOTAL_SIZE / CHUNK_SIZE);
+    const firmwareBuffer = new Uint8Array(TOTAL_SIZE);
+
+    console.log('Clearing DFU Status...');
+    await device.controlTransferOut({
+      requestType: 'class',
+      recipient: 'interface',
+      request: 4, // DFU_CLRSTATUS
+      value: 0,
+      index: 0
+    });
+    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
+
+    console.log('Setting Address Pointer to 0x0800C000 for reading...');
+    const setAddrCmd = new Uint8Array([0x21, 0x00, 0xC0, 0x00, 0x08]);
+    await device.controlTransferOut({
+      requestType: 'class',
+      recipient: 'interface',
+      request: 1, // DFU_DNLOAD
+      value: 0,
+      index: 0
+    }, setAddrCmd);
+
+    await device.controlTransferIn({
+      requestType: 'class',
+      recipient: 'interface',
+      request: 3, // DFU_GETSTATUS
+      value: 0,
+      index: 0
+    }, 6);
+    
+    await new Promise(r => setTimeout(r, isAndroid16 ? 200 : 100));
+
+    await device.controlTransferOut({
+      requestType: 'class',
+      recipient: 'interface',
+      request: 4, // DFU_CLRSTATUS
+      value: 0,
+      index: 0
+    });
+    await new Promise(r => setTimeout(r, isAndroid16 ? 100 : 50));
+
+    console.log('Starting firmware read...');
+    for (let block = 0; block < TOTAL_BLOCKS; block++) {
+      const result = await device.controlTransferIn({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 2, // DFU_UPLOAD
+        value: block + 2,
+        index: 0
+      }, CHUNK_SIZE);
+
+      if (result.data) {
+        firmwareBuffer.set(new Uint8Array(result.data.buffer), block * CHUNK_SIZE);
+      }
+
+      if (isAndroid16) {
+        await new Promise(r => setTimeout(r, 40));
+      } else {
+        await new Promise(r => setTimeout(r, 10));
+      }
+
+      onProgress(((block + 1) / TOTAL_BLOCKS) * 100);
+    }
+
+    console.log('Firmware read complete.');
+    
+    // Reset device to exit DFU mode
+    try {
+      await device.reset();
+    } catch (e) {
+      console.log('USB reset threw an error (expected):', e);
+    }
+    activeDevice = null;
+
+    return firmwareBuffer;
+  } catch (error) {
+    console.error('Firmware Reading Error:', error);
+    return null;
   }
 };
