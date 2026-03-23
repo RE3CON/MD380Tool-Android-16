@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="MD380 Tool - Web-based management suite for Tytera MD-380 DMR radios." />
+    <meta name="theme-color" content="#121212" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📻</text></svg>" />
     <title>MD380 Tool | Web Management Suite</title>
     <script type="text/javascript">
       // Single Page Apps for GitHub Pages
@@ -20,7 +23,7 @@
             return s.replace(/~and~/g, '&')
           }).join('?');
           window.history.replaceState(null, null,
-              l.pathname.slice(0, -1) + decoded + l.hash
+              l.pathname.slice(0, (l.pathname.endsWith('/') ? -1 : undefined)) + decoded + l.hash
           );
         }
       }(window.location))
@@ -31,4 +34,3 @@
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

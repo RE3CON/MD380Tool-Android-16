@@ -1,5 +1,5 @@
 {
-  "name": "UVMOD RX-TX",
-  "description": "Online custom firmware mod generator for Quansheng UV-K5, K6, and R5 Plus handheld HAM radios.",
-  "requestFramePermissions": ["usb", "serial"]
+  "name": "MD380 Tool",
+  "description": "A web-based management tool for Tytera MD-380 DMR radios, featuring user database updates, firmware patching, and Android 16 compatibility guides.",
+  "requestFramePermissions": ["usb"]
 }
