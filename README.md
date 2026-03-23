@@ -1,10 +1,4 @@
 # MD380 Web Management Suite
-[![Web Flasher Available](https://img.shields.io/badge/WebUSB-Flash_Directly_from_Browser-red.svg?style=for-the-badge&logo=googlechrome)](https://re3con.github.io/MD380Tool-Android-16/)
-
-> **🚀 NEW:** You can now flash your MD380 User Database directly from your browser using our WebUSB tool! Fully compatible with Android 16 and Samsung Galaxy S24 Ultra.
-> 
-> 👉 **[Launch MD380 Web Flasher](https://re3con.github.io/MD380Tool-Android-16/)**
-> 💻 **[View Source Code](https://github.com/RE3CON/MD380Tool-Android-16)**
 
 A modern, web-based management tool for the Tytera MD-380 and MD-390 DMR radios. This suite allows for firmware flashing, user database synchronization, and system diagnostics directly from your browser using WebUSB.
 

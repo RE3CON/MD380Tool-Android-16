@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MD380Tool</string>
+    <string name="title_activity_main">MD380Tool</string>
+    <string name="package_name">com.re3con.md380tool</string>
+    <string name="custom_url_scheme">com.re3con.md380tool</string>
+</resources>
