@@ -16,7 +16,9 @@ import {
   Github,
   FileText,
   Users,
-  Folder
+  Folder,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -32,20 +34,24 @@ import {
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { DMRUser, DeviceStatus, AndroidPatchInfo } from './types';
-import { fetchDMRUsers, requestDevice, flashFirmware, flashDatabase, readFirmware } from './services/dmrService';
+import { fetchDMRUsers, requestDevice, flashFirmware, flashDatabase, readFirmware, readCodeplug, writeCodeplug, uploadFirmwareFile } from './services/dmrService';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'device' | 'database' | 'firmware' | 'android' | 'resources' | 'features'>('device');
+  const [activeTab, setActiveTab] = useState<'device' | 'database' | 'firmware' | 'codeplug' | 'android' | 'resources' | 'features'>('device');
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [users, setUsers] = useState<DMRUser[]>([]);
   const [loading, setLoading] = useState(false);
   const [flashing, setFlashing] = useState(false);
   const [reading, setReading] = useState(false);
   const [flashProgress, setFlashProgress] = useState(0);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [android16Mode, setAndroid16Mode] = useState(false);
+  const firmwareInputRef = useRef<HTMLInputElement>(null);
+  const codeplugInputRef = useRef<HTMLInputElement>(null);
   const [device, setDevice] = useState<DeviceStatus>({
     connected: false,
     model: 'MD-380',
@@ -93,6 +99,26 @@ Thread.sleep(5);`,
       setLoading(false);
     };
     loadData();
+
+    // Listen for USB disconnects
+    const handleDisconnect = (event: any) => {
+      console.log('USB Device disconnected:', event.device);
+      setDevice(prev => ({
+        ...prev,
+        connected: false
+      }));
+    };
+
+    const usb = (navigator as any).usb;
+    if (usb) {
+      usb.addEventListener('disconnect', handleDisconnect);
+    }
+
+    return () => {
+      if (usb) {
+        usb.removeEventListener('disconnect', handleDisconnect);
+      }
+    };
   }, []);
 
   const handleConnect = async () => {
@@ -126,8 +152,14 @@ Thread.sleep(5);`,
     
     let firmwareBuffer: Uint8Array;
     try {
-      console.log(`Fetching firmware from ${url}...`);
-      const response = await fetch(url);
+      let fetchUrl = url;
+      // Automatically convert github.com/user/repo/blob/master/file.bin to raw.githubusercontent.com/...
+      if (fetchUrl.includes('github.com') && fetchUrl.includes('/blob/')) {
+        fetchUrl = fetchUrl.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
+      }
+
+      console.log(`Fetching firmware from ${fetchUrl}...`);
+      const response = await fetch(fetchUrl);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -164,6 +196,51 @@ Thread.sleep(5);`,
     setFlashing(false);
   };
 
+  const handleCustomFlash = async () => {
+    if (!device.connected) {
+      alert('Please connect your radio first.');
+      setActiveTab('device');
+      return;
+    }
+    if (!selectedFile) {
+      alert('Please select a firmware file first.');
+      return;
+    }
+
+    setFlashing(true);
+    setFlashProgress(0);
+
+    try {
+      const firmwareBuffer = await uploadFirmwareFile(selectedFile);
+      const success = await flashFirmware(firmwareBuffer, (progress) => {
+        setFlashProgress(progress);
+      }, android16Mode);
+
+      if (success) {
+        setDevice({
+          ...device,
+          connected: false,
+          firmware: selectedFile.name,
+          lastSync: new Date().toLocaleString()
+        });
+        alert(`Successfully flashed ${selectedFile.name}! The radio is now restarting.`);
+      } else {
+        alert('Flashing failed. Please check your connection.');
+      }
+    } catch (error) {
+      console.error('Failed to read firmware file:', error);
+      alert('Failed to read firmware file.');
+    }
+
+    setFlashing(false);
+  };
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+      setSelectedFile(event.target.files[0]);
+    }
+  };
+
   const handleReadFirmware = async () => {
     if (!device.connected) {
       alert('Please connect your radio first.');
@@ -174,9 +251,18 @@ Thread.sleep(5);`,
     setReading(true);
     setFlashProgress(0);
 
-    const firmwareData = await readFirmware((progress) => {
-      setFlashProgress(progress);
-    }, android16Mode);
+    let firmwareData;
+    try {
+      firmwareData = await readFirmware((progress) => {
+        setFlashProgress(progress);
+      }, android16Mode);
+    } catch (error) {
+      console.error('Firmware Reading Error:', error);
+      alert(`Firmware Reading Error: ${error instanceof Error ? error.message : String(error)}`);
+      setReading(false);
+      setFlashProgress(0);
+      return;
+    }
 
     if (firmwareData) {
       // Create a blob and download it
@@ -201,6 +287,87 @@ Thread.sleep(5);`,
     }
 
     setReading(false);
+  };
+
+  const handleReadCodeplug = async () => {
+    if (!device.connected) {
+      alert('Please connect your radio first.');
+      setActiveTab('device');
+      return;
+    }
+
+    setReading(true);
+    setFlashProgress(0);
+
+    const codeplugData = await readCodeplug((progress) => {
+      setFlashProgress(progress);
+    }, android16Mode);
+
+    if (codeplugData) {
+      const blob = new Blob([codeplugData], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `MD380_Codeplug_${new Date().toISOString().split('T')[0]}.rdt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      setDevice({
+        ...device,
+        connected: false,
+        lastSync: new Date().toLocaleString()
+      });
+      alert('Successfully read codeplug! The backup has been downloaded and the radio is restarting.');
+    } else {
+      alert('Failed to read codeplug. Please check your connection.');
+    }
+
+    setReading(false);
+  };
+
+  const handleWriteCodeplugSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
+
+    if (!device.connected) {
+      alert('Please connect your radio first.');
+      setActiveTab('device');
+      return;
+    }
+
+    const buffer = await selectedFile.arrayBuffer();
+    const codeplugBuffer = new Uint8Array(buffer);
+
+    if (codeplugBuffer.length !== 262144) {
+      alert(`Invalid codeplug file size. Expected 262144 bytes, got ${codeplugBuffer.length} bytes.`);
+      return;
+    }
+
+    setFlashing(true);
+    setFlashProgress(0);
+
+    const success = await writeCodeplug(codeplugBuffer, (progress) => {
+      setFlashProgress(progress);
+    }, android16Mode);
+
+    if (success) {
+      setDevice({
+        ...device,
+        connected: false,
+        lastSync: new Date().toLocaleString()
+      });
+      alert(`Successfully wrote codeplug ${selectedFile.name}! The radio is now restarting.`);
+    } else {
+      alert('Failed to write codeplug. Please check your connection.');
+    }
+    
+    setFlashing(false);
+    
+    if (codeplugInputRef.current) {
+      codeplugInputRef.current.value = '';
+    }
   };
 
   const [dbFile, setDbFile] = useState<File | null>(null);
@@ -316,14 +483,22 @@ Thread.sleep(5);`,
   return (
     <div className="flex h-screen overflow-hidden bg-[#121212] text-[#e4e3e0]">
       {/* Sidebar */}
-      <aside className="w-64 border-r border-[#333333] flex flex-col">
-        <div className="p-6 border-b border-[#333333]">
-          <div className="flex items-center gap-3 mb-2">
-            <Radio className="w-6 h-6 text-[#ffb000]" />
-            <h1 className="text-lg font-bold tracking-tighter uppercase">MD380 Tool</h1>
+      <aside className={cn("border-r border-[#333333] flex flex-col transition-all duration-300", isSidebarCollapsed ? "w-20" : "w-64")}>
+        <div className="p-6 border-b border-[#333333] flex items-center justify-between">
+          <div className={cn("flex items-center gap-3", isSidebarCollapsed && "justify-center w-full")}>
+            <Radio className="w-6 h-6 text-[#ffb000] shrink-0" />
+            {!isSidebarCollapsed && <h1 className="text-lg font-bold tracking-tighter uppercase">MD380 Tool</h1>}
           </div>
-          <p className="text-[10px] uppercase tracking-widest opacity-50">Web Management Suite</p>
+          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-1 hover:bg-[#1a1a1a] rounded shrink-0">
+             {isSidebarCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+          </button>
         </div>
+
+        {!isSidebarCollapsed && (
+          <div className="px-6 py-2">
+            <p className="text-[10px] uppercase tracking-widest opacity-50">Web Management Suite</p>
+          </div>
+        )}
 
         <nav className="flex-1 py-4">
           {[
@@ -331,48 +506,56 @@ Thread.sleep(5);`,
             { id: 'features', icon: Activity, label: 'Features' },
             { id: 'database', icon: Database, label: 'User Database' },
             { id: 'firmware', icon: Cpu, label: 'Firmware' },
+            { id: 'codeplug', icon: FileText, label: 'Codeplug (.rdt)' },
             { id: 'android', icon: Smartphone, label: 'Android 16 Patch' },
             { id: 'resources', icon: Info, label: 'Resources' },
           ].map((item) => (
             <button
               key={item.id}
               onClick={() => setActiveTab(item.id as any)}
+              title={isSidebarCollapsed ? item.label : undefined}
               className={cn(
                 "w-full flex items-center gap-3 px-6 py-3 text-sm font-medium transition-colors",
+                isSidebarCollapsed && "justify-center px-0",
                 activeTab === item.id 
                   ? "bg-[#ffb000] text-[#121212]" 
                   : "hover:bg-[#1a1a1a] text-[#e4e3e0]/70"
               )}
             >
-              <item.icon className="w-4 h-4" />
-              {item.label}
+              <item.icon className="w-4 h-4 shrink-0" />
+              {!isSidebarCollapsed && item.label}
             </button>
           ))}
         </nav>
 
         <div className="p-6 border-t border-[#333333]">
-          <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest opacity-50 mb-4">
-            <Settings className="w-3 h-3" />
-            System Config
-          </div>
-          <div className="space-y-2 mb-4">
-            <div className="flex justify-between text-[11px]">
-              <span>API Status</span>
-              <span className="text-emerald-500">ONLINE</span>
+          {!isSidebarCollapsed && (
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest opacity-50 mb-4">
+              <Settings className="w-3 h-3" />
+              System Config
             </div>
-            <div className="flex justify-between text-[11px]">
-              <span>WebUSB</span>
-              <span className="text-emerald-500">SUPPORTED</span>
+          )}
+          {!isSidebarCollapsed && (
+            <div className="space-y-2 mb-4">
+              <div className="flex justify-between text-[11px]">
+                <span>API Status</span>
+                <span className="text-emerald-500">ONLINE</span>
+              </div>
+              <div className="flex justify-between text-[11px]">
+                <span>WebUSB</span>
+                <span className="text-emerald-500">SUPPORTED</span>
+              </div>
             </div>
-          </div>
+          )}
           <a 
             href="https://github.com/RE3CON/MD380Tool-Android-16" 
             target="_blank" 
             rel="noreferrer"
-            className="flex items-center gap-2 text-xs text-[#e4e3e0]/70 hover:text-[#ffb000] transition-colors"
+            title={isSidebarCollapsed ? "View on GitHub" : undefined}
+            className={cn("flex items-center gap-2 text-xs text-[#e4e3e0]/70 hover:text-[#ffb000] transition-colors", isSidebarCollapsed && "justify-center")}
           >
-            <Github className="w-4 h-4" />
-            View on GitHub
+            <Github className="w-4 h-4 shrink-0" />
+            {!isSidebarCollapsed && "View on GitHub"}
           </a>
         </div>
       </aside>
@@ -388,6 +571,7 @@ Thread.sleep(5);`,
               {activeTab === 'features' && 'MD380Tools Enhanced Feature Set'}
               {activeTab === 'database' && 'DMR User Registry Sync'}
               {activeTab === 'firmware' && 'Binary Management & Flashing'}
+              {activeTab === 'codeplug' && 'Codeplug Configuration'}
               {activeTab === 'android' && 'Mobile Compatibility Layer'}
               {activeTab === 'resources' && 'Documentation & Archives'}
             </span>
@@ -797,6 +981,63 @@ Thread.sleep(5);`,
               </motion.div>
             )}
 
+            {activeTab === 'codeplug' && (
+              <motion.div
+                key="codeplug"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-8"
+              >
+                <div className="widget-container p-8">
+                  <div className="flex items-center gap-4 mb-6">
+                    <FileText className="w-8 h-8 text-[#ffb000]" />
+                    <div>
+                      <h2 className="text-xl font-bold">Codeplug Management</h2>
+                      <p className="text-sm opacity-60">Read and write the radio's configuration (Channels, Zones, Contacts).</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="p-6 border border-emerald-500/50 rounded-lg bg-[#1a1a1a] hover:border-emerald-500 transition-colors group relative overflow-hidden">
+                      <div className="flex justify-between items-start mb-4">
+                        <h3 className="font-bold text-emerald-400 text-lg">Read Codeplug</h3>
+                      </div>
+                      <p className="text-sm opacity-70 mb-6">Download the current codeplug from your radio and save it as an .rdt file on your computer.</p>
+                      <button 
+                        onClick={handleReadCodeplug}
+                        disabled={reading || flashing}
+                        className="btn-primary bg-emerald-500 hover:bg-emerald-600 text-black text-xs py-2 px-6 disabled:opacity-50"
+                      >
+                        {reading ? `Reading ${Math.round(flashProgress)}%` : 'Read from Radio'}
+                      </button>
+                    </div>
+
+                    <div className="p-6 border border-[#ffb000]/50 rounded-lg bg-[#1a1a1a] hover:border-[#ffb000] transition-colors group relative overflow-hidden">
+                      <div className="flex justify-between items-start mb-4">
+                        <h3 className="font-bold text-[#ffb000] text-lg">Write Codeplug</h3>
+                      </div>
+                      <p className="text-sm opacity-70 mb-6">Upload an .rdt codeplug file from your computer and write it to the radio's memory.</p>
+                      <input 
+                        type="file" 
+                        ref={codeplugInputRef} 
+                        onChange={handleWriteCodeplugSelect} 
+                        accept=".rdt,.bin" 
+                        className="hidden" 
+                      />
+                      <button 
+                        onClick={() => codeplugInputRef.current?.click()}
+                        disabled={reading || flashing}
+                        className="btn-primary text-xs py-2 px-6 disabled:opacity-50"
+                      >
+                        {flashing ? `Writing ${Math.round(flashProgress)}%` : 'Write to Radio'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
             {activeTab === 'firmware' && (
               <motion.div
                 key="firmware"
@@ -887,6 +1128,29 @@ Thread.sleep(5);`,
                         >
                           <Download className="w-3 h-3" /> Source
                         </a>
+                      </div>
+                    </div>
+
+                    <div className="p-6 border border-[#333333] rounded-lg bg-[#1a1a1a] hover:border-[#ffb000] transition-colors group">
+                      <div className="flex justify-between items-start mb-4">
+                        <h3 className="font-bold text-[#ffb000]">Custom Firmware Upload</h3>
+                        <span className="text-[10px] opacity-50 font-mono">.bin file</span>
+                      </div>
+                      <p className="text-xs opacity-60 mb-6">Upload your own firmware binary file. Ensure it is compatible with your radio model.</p>
+                      <div className="flex flex-col gap-3">
+                        <input 
+                          type="file" 
+                          accept=".bin" 
+                          onChange={handleFileChange}
+                          className="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-[#333333] file:text-white hover:file:bg-[#444444]"
+                        />
+                        <button 
+                          onClick={handleCustomFlash}
+                          disabled={flashing || !selectedFile}
+                          className="btn-primary text-xs py-2 disabled:opacity-50"
+                        >
+                          {flashing ? `Flashing ${Math.round(flashProgress)}%` : 'Flash Custom File'}
+                        </button>
                       </div>
                     </div>
 
